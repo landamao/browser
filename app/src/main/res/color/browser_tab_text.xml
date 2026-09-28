@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 未选中:弱化字色;选中在 layout 里用 on_surface -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:color="@color/on_surface" android:state_selected="true" />
+    <item android:color="@color/on_surface" android:state_checked="true" />
+    <item android:color="@color/hint" />
+</selector>

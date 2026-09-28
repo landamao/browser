@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 日间:淡粉色主题(沿用 ldmbot 配色) -->
+    <color name="primary">#E8A0BF</color>
+    <color name="primary_dark">#D4849A</color>
+    <color name="primary_light">#F5C6D6</color>
+    <color name="accent">#E891B0</color>
+    <color name="bg">#FFF5F8</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="on_primary">#FFFFFF</color>
+    <color name="on_surface">#3D2A33</color>
+    <color name="divider">#F0D6E0</color>
+    <color name="hint">#B08A98</color>
+    <!-- 全部标签页列表文字:中性近黑(不用主题色,避免发粉看不清);夜间转浅灰 -->
+    <color name="all_tab_text">#1B1B1B</color>
+    <color name="ic_launcher_background">#E8A0BF</color>
+</resources>

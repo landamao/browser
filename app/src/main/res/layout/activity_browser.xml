@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/browser_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingStart="6dp"
+        android:paddingEnd="4dp"
+        android:background="@color/surface">
+
+        <ImageButton
+            android:id="@+id/btn_back"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/browser_back"
+            android:src="@drawable/ic_arrow_back"
+            app:tint="@color/on_surface" />
+
+        <ImageButton
+            android:id="@+id/btn_forward"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/browser_forward"
+            android:src="@drawable/ic_arrow_forward"
+            app:tint="@color/on_surface" />
+
+        <!-- 地址栏容器:引擎选择、前往/搜索都收在框内 -->
+        <LinearLayout
+            android:id="@+id/address_bar_box"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="4dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:background="@drawable/bg_address_bar">
+
+            <!-- 左:搜索引擎选择,显示当前引擎名,点击弹出 百度/Bing/Google -->
+            <TextView
+                android:id="@+id/btn_engine"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:gravity="center"
+                android:paddingStart="9dp"
+                android:paddingEnd="5dp"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:textColor="@color/primary"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/browser_engine"
+                tools:text="百度" />
+
+            <EditText
+                android:id="@+id/address_bar"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="@null"
+                android:singleLine="true"
+                android:selectAllOnFocus="true"
+                android:imeOptions="actionGo"
+                android:inputType="textUri"
+                android:hint="@string/browser_address_hint"
+                android:textColor="@color/on_surface"
+                android:textColorHint="@color/hint"
+                android:paddingStart="3dp"
+                android:paddingEnd="3dp" />
+
+            <!-- 右:动作按钮,图标随输入内容自动切换(像网址=→前往,否则=🔍搜索) -->
+            <ImageButton
+                android:id="@+id/btn_action"
+                android:layout_width="30dp"
+                android:layout_height="30dp"
+                android:layout_marginEnd="4dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/browser_search"
+                android:src="@drawable/ic_search"
+                app:tint="@color/on_surface" />
+
+            <!-- 右:收藏星星(仅浏览态显示,编辑态让位给引擎/动作按钮)。
+                 已收藏=黄色实心,未收藏=空心;颜色画在 drawable 里,这里不做 tint -->
+            <ImageButton
+                android:id="@+id/btn_bookmark"
+                android:layout_width="30dp"
+                android:layout_height="30dp"
+                android:layout_marginEnd="4dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/browser_bookmark"
+                android:src="@drawable/ic_star_outline" />
+        </LinearLayout>
+
+        <!-- 刷新在菜单左侧;加载中变成 X(点击停止加载),空闲时是普通刷新 -->
+        <ImageButton
+            android:id="@+id/btn_refresh"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/refresh"
+            android:src="@drawable/ic_refresh"
+            app:tint="@color/on_surface" />
+
+        <ImageButton
+            android:id="@+id/btn_menu"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/browser_menu"
+            android:src="@drawable/ic_more"
+            app:tint="@color/on_surface" />
+    </LinearLayout>
+
+    <!-- 页面加载进度条:加载中显示,100% 后收起 -->
+    <ProgressBar
+        android:id="@+id/browser_progress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="3dp"
+        android:max="100"
+        android:progressTint="@color/primary"
+        android:progressBackgroundTint="@color/divider"
+        android:visibility="gone" />
+
+    <!-- 标签栏 + 右缘「全部标签页」按钮:按钮用不透明底盖住下方滚动经过的标签 -->
+    <FrameLayout
+        android:id="@+id/browser_tab_bar"
+        android:layout_width="match_parent"
+        android:layout_height="42dp"
+        android:background="@color/surface">
+
+        <com.google.android.material.tabs.TabLayout
+            android:id="@+id/browser_tabs"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:paddingEnd="32dp"
+            app:tabPaddingStart="0dp"
+            app:tabPaddingEnd="0dp"
+            app:tabIndicatorHeight="0dp"
+            app:tabMode="scrollable"
+            app:tabGravity="start"
+            app:tabTextColor="@color/browser_tab_text"
+            app:tabSelectedTextColor="@color/on_surface"
+            app:tabIndicatorColor="@color/primary"
+            app:tabBackground="@android:color/transparent"
+            app:tabRippleColor="@color/primary_light" />
+
+        <ImageButton
+            android:id="@+id/btn_all_tabs"
+            android:layout_width="32dp"
+            android:layout_height="match_parent"
+            android:layout_gravity="end"
+            android:background="@color/surface"
+            android:contentDescription="@string/browser_all_tabs"
+            android:src="@drawable/ic_expand_more"
+            app:tint="@color/on_surface" />
+    </FrameLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <FrameLayout
+            android:id="@+id/web_container"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- 加载失败覆盖层:不往 WebView 塞 data: 错误页,reload 仍是真实地址 -->
+        <LinearLayout
+            android:id="@+id/browser_error_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="24dp"
+            android:background="@color/bg"
+            android:clickable="true"
+            android:focusable="true"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="⚠️"
+                android:textSize="42sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/browser_error_title"
+                android:textColor="@color/on_surface"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/browser_error_url"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:gravity="center"
+                android:maxLines="2"
+                android:ellipsize="middle"
+                android:fontFamily="monospace"
+                android:textColor="@color/hint"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/browser_error_reason"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:gravity="center"
+                android:maxLines="2"
+                android:textColor="@color/hint"
+                android:textSize="12sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/browser_error_hint"
+                android:textColor="@color/hint"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btn_error_retry"
+                android:layout_width="wrap_content"
+                android:layout_height="42dp"
+                android:layout_marginTop="18dp"
+                android:paddingStart="28dp"
+                android:paddingEnd="28dp"
+                android:text="@string/browser_error_retry"
+                android:textAllCaps="false"
+                android:backgroundTint="@color/primary"
+                android:textColor="@color/on_primary" />
+        </LinearLayout>
+
+        <!-- 所有标签都关闭后的空状态 -->
+        <LinearLayout
+            android:id="@+id/browser_empty"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/browser_no_tabs"
+                android:textColor="@color/on_surface"
+                android:textSize="16sp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="@string/browser_no_tabs_hint"
+                android:textColor="@color/hint"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btn_empty_new_tab"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="@string/new_tab"
+                android:textAllCaps="false"
+                android:backgroundTint="@color/primary"
+                android:textColor="@color/on_primary" />
+        </LinearLayout>
+    </FrameLayout>
+</LinearLayout>

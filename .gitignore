@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+build/
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+# 签名密钥不入库
+keystore.properties
+*.jks
+*.p12
+# 本机自用文件不入库
+log/
+BUILD.md
+_test_build.bat
+.zcodeignore
