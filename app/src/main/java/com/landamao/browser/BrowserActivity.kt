@@ -2655,6 +2655,7 @@ class BrowserActivity : AppCompatActivity() {
         browserEmpty.visibility = View.GONE
         currentIndex = index
         persistTabs()
+        clearWebFocusBeforeSwap()
         webContainer.removeAllViews()
         val wv = tabs[index].webView
         (wv.parent as? ViewGroup)?.removeView(wv)
@@ -2695,11 +2696,25 @@ class BrowserActivity : AppCompatActivity() {
 
     private fun showEmptyState() {
         currentIndex = 0
+        clearWebFocusBeforeSwap()
         webContainer.removeAllViews()
         browserEmpty.visibility = View.VISIBLE
         errorOverlay.visibility = View.GONE
         addressBar.setText("")
         updateToolbarState()
+    }
+
+    /**
+     * 摘走 webContainer 里的 WebView 前先收掉焦点:带焦点的视图直接 remove,框架会
+     * 无条件把窗口焦点兜底重派(ViewGroup.removeAllViewsInLayout → rootViewRequestFocus,
+     * 不看触摸模式),DecorView 按 FOCUS_DOWN 找到的第一个可聚焦控件是地址栏 EditText,
+     * 于是编辑态外壳(引擎/动作按钮、快捷输入条)连带键盘莫名弹出。
+     * 触摸模式下 clearFocus 不触发兜底,焦点静默清空,正好是想要的浏览态。
+     */
+    private fun clearWebFocusBeforeSwap() {
+        for (i in 0 until webContainer.childCount) {
+            webContainer.getChildAt(i).takeIf { it.hasFocus() }?.clearFocus()
+        }
     }
 
     /** 关闭指定标签(× 按钮与长按菜单共用;锁定的标签同样能从这里关闭) */
