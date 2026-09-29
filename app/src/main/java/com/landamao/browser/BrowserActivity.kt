@@ -108,7 +108,7 @@ import kotlin.math.roundToInt
  * - 前进后退走自管历史(每标签一份 url 列表,不用 WebView 原生历史):
  *   自管历史才能随会话持久化,重启后仍能按原顺序前进后退
  * - 设置弹窗:清除数据(四项数据范围勾选 + 「仅当前网站」作用域开关)、
- *   调换标签页和输入框位置;点功能不关弹窗,弹窗逐层叠加,点空白处从最上层开始一层一层关闭
+ *   调换标签页和网址栏的位置、标签页和网址栏上下分布;点功能不关弹窗,弹窗逐层叠加,点空白处从最上层开始一层一层关闭
  * - 自定义主页:标题 + 链接;主页动作与新标签页都用它,未设置时不自动新建标签页,
  *   空状态下直接在地址栏输入网址即可新建标签页
  * - 电脑模式:桌面 UA + 强制宽布局视口(约 1280)+ 可缩放,让站点走桌面排版
@@ -214,8 +214,11 @@ class BrowserActivity : AppCompatActivity() {
     /** 退出前保存(菜单开关,默认开):开=实时+退出时落盘完整会话,关=退出清档不恢复 */
     private var saveOnExit = true
 
-    /** 调换布局:标签页在地址栏上方(设置弹窗切换,持久化) */
+    /** 调换布局:标签页在网址栏上方(设置弹窗切换,持久化);上下分布时决定哪一行贴顶 */
     private var tabsOnTop = false
+
+    /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(设置弹窗切换,持久化) */
+    private var urlBarBottom = false
 
     /** 标签栏隐藏(长按「菜单」/「全部标签页」切换,持久化;隐藏后省出整行屏幕) */
     private var tabBarHidden = false
@@ -345,6 +348,7 @@ class BrowserActivity : AppCompatActivity() {
         desktopMode = prefs.getBoolean(PREF_DESKTOP, false)
         saveOnExit = prefs.getBoolean(PREF_SAVE_ON_EXIT, true)
         tabsOnTop = prefs.getBoolean(PREF_TABS_ON_TOP, false)
+        urlBarBottom = prefs.getBoolean(PREF_URL_BAR_BOTTOM, false)
         tabBarHidden = prefs.getBoolean(PREF_TAB_BAR_HIDDEN, false)
         tabMinWidth = prefs.getInt(PREF_TAB_MIN_WIDTH, TAB_WIDTH_DEFAULT_MIN)
         tabMaxWidth = prefs.getInt(PREF_TAB_MAX_WIDTH, TAB_WIDTH_DEFAULT_MAX)
@@ -352,7 +356,7 @@ class BrowserActivity : AppCompatActivity() {
 
         tabLayout.addOnTabSelectedListener(tabSelectedListener)
 
-        // 布局调换(设置弹窗切换):标签页放到地址栏上方
+        // 布局调换(设置弹窗切换):标签页放到网址栏上方
         applyLayoutOrder()
         // 标签栏隐藏状态(长按「菜单」/「全部标签页」切换):重建外壳后保持
         tabBarWrap.visibility = if (tabBarHidden) View.GONE else View.VISIBLE
@@ -1742,6 +1746,10 @@ class BrowserActivity : AppCompatActivity() {
             setOnClickListener { toggleTabsOnTop() }
         })
         box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_url_bar_bottom)
+            setOnClickListener { toggleUrlBarBottom() }
+        })
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_tab_width)
             setOnClickListener { showTabWidthDialog() }
         })
@@ -1927,7 +1935,7 @@ class BrowserActivity : AppCompatActivity() {
         }
     }
 
-    /** 设置弹窗「调换标签页和输入框位置」:切换标签栏与工具栏行的上下位置并持久化 */
+    /** 设置弹窗「调换标签页和网址栏的位置」:切换标签栏与工具栏行的上下位置并持久化 */
     private fun toggleTabsOnTop() {
         tabsOnTop = !tabsOnTop
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1937,12 +1945,52 @@ class BrowserActivity : AppCompatActivity() {
         applyLayoutOrder()
     }
 
-    /** 按开关重排根布局:调换后标签栏在最上,原布局标签栏在进度条之下 */
+    /** 设置弹窗「标签页和网址栏上下分布」:两行分居屏幕顶/底并持久化 */
+    private fun toggleUrlBarBottom() {
+        urlBarBottom = !urlBarBottom
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_URL_BAR_BOTTOM, urlBarBottom)
+            .apply()
+        applyLayoutOrder()
+    }
+
+    /**
+     * 按两个开关重排根布局(「调换」决定哪一行贴顶),进度条始终贴着网址栏行:
+     * - 默认:网址栏行 / 进度条 / 标签栏 / 内容
+     * - 调换:标签栏 / 网址栏行 / 进度条 / 内容(两行都在顶部,只换先后)
+     * - 上下分布:一行贴顶、另一行贴底,网页内容夹在中间
+     */
     private fun applyLayoutOrder() {
         val root = findViewById<LinearLayout>(R.id.browser_root) ?: return
+        val toolbarRow = findViewById<View>(R.id.toolbar_row) ?: return
+        // 内容锚点 = 套住 WebView 的那层权重 FrameLayout,重排时它的位置不动
+        val contentFrame = findViewById<View>(R.id.content_frame) ?: return
         root.removeView(tabBarWrap)
-        // 原顺序:工具栏行 / 进度条 / 标签栏 / 内容
-        root.addView(tabBarWrap, if (tabsOnTop) 0 else 2)
+        root.removeView(progressBar)
+        root.removeView(toolbarRow)
+        if (urlBarBottom) {
+            if (tabsOnTop) {
+                // 标签栏贴顶;网址栏行贴底,进度条紧贴在它上方
+                root.addView(tabBarWrap, 0)
+                root.addView(progressBar, root.indexOfChild(contentFrame) + 1)
+                root.addView(toolbarRow, root.indexOfChild(contentFrame) + 2)
+            } else {
+                // 网址栏行贴顶,进度条紧随其后;标签栏贴底
+                root.addView(toolbarRow, 0)
+                root.addView(progressBar, 1)
+                root.addView(tabBarWrap, root.indexOfChild(contentFrame) + 1)
+            }
+        } else if (tabsOnTop) {
+            root.addView(tabBarWrap, 0)
+            root.addView(toolbarRow, 1)
+            root.addView(progressBar, 2)
+        } else {
+            // 原顺序:工具栏行 / 进度条 / 标签栏 / 内容
+            root.addView(toolbarRow, 0)
+            root.addView(progressBar, 1)
+            root.addView(tabBarWrap, 2)
+        }
     }
 
     /** 标签栏右缘箭头:下方弹出全部标签页列表(左缘三杠拖动排序,点行切换,右侧 × 关闭) */
@@ -4107,6 +4155,9 @@ class BrowserActivity : AppCompatActivity() {
 
         /** 调换布局:标签页在地址栏上方(设置弹窗切换) */
         private const val PREF_TABS_ON_TOP = "tabs_on_top"
+
+        /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(设置弹窗切换) */
+        private const val PREF_URL_BAR_BOTTOM = "url_bar_bottom"
 
         /** 标签栏隐藏(长按「菜单」/「全部标签页」切换,持久化) */
         private const val PREF_TAB_BAR_HIDDEN = "tab_bar_hidden"

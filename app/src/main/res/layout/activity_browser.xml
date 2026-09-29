@@ -8,7 +8,9 @@
     android:orientation="vertical"
     android:background="@color/bg">
 
+    <!-- 工具栏行:前进/后退 + 地址栏框 + 刷新 + 菜单(「上下分布」开关会把整行挪到屏幕底部) -->
     <LinearLayout
+        android:id="@+id/toolbar_row"
         android:layout_width="match_parent"
         android:layout_height="48dp"
         android:orientation="horizontal"
@@ -167,6 +169,7 @@
     </FrameLayout>
 
     <FrameLayout
+        android:id="@+id/content_frame"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
