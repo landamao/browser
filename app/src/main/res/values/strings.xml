@@ -20,6 +20,11 @@
     <string name="browser_stop">停止加载</string>
     <string name="browser_open_in_system">在其他浏览器打开</string>
     <string name="browser_more">更多</string>
+    <!-- 更多→关于:版本号与 GitHub 仓库入口 -->
+    <string name="browser_about">关于</string>
+    <string name="browser_about_version">版本 %1$s（%2$s）</string>
+    <string name="browser_about_repo">GitHub 仓库</string>
+    <string name="browser_copied">已复制</string>
     <string name="browser_open_file_fail">无法读取该文件</string>
     <string name="browser_night_on">夜间模式:开</string>
     <string name="browser_night_off">夜间模式:关</string>

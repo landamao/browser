@@ -112,7 +112,8 @@ import kotlin.math.roundToInt
  * - 重命名:标题固定不再跟随网页;再次重命名清空内容确定即恢复跟随
  * - 排序:「全部标签页」列表里按住条目左缘三杠上下拖动换位,松手即保存
  * - 菜单内:主页(长按可设置自定义主页)、收藏、历史记录、退出前保存开关、设置、更多(最后一项)
- * - 更多弹窗:强制刷新、在其他浏览器打开、电脑模式;点条目执行并自动关闭弹窗
+ * - 更多弹窗:强制刷新、在其他浏览器打开、电脑模式、关于(版本号点击复制,
+ *   点 GitHub 仓库收起弹窗并在本应用新开标签页打开);点条目执行并自动关闭弹窗
  * - 历史记录:以标签页方式打开(标题+网址居左,时间居右,点条目本标签打开该站);
  *   每次访问自动记录,清除数据的「浏览历史」与「仅当前网站」会同步清理;
  *   长按条目:删除 / 复制链接 / 在新标签页打开 / 多选模式(底部工具栏可全选、批量删除)
@@ -974,7 +975,7 @@ class BrowserActivity : AppCompatActivity() {
     }
 
     /**
-     * 更多弹窗(菜单最后一项):强制刷新、在其他浏览器打开、电脑模式。
+     * 更多弹窗(菜单最后一项):强制刷新、在其他浏览器打开、电脑模式、关于。
      * 与设置弹窗不同,点条目即执行并自动关闭弹窗。
      */
     private fun showMoreDialog() {
@@ -997,10 +998,62 @@ class BrowserActivity : AppCompatActivity() {
         addRow(
             getString(if (isNightNow()) R.string.browser_night_on else R.string.browser_night_off)
         ) { toggleNightMode() }
+        addRow(getString(R.string.browser_about)) { showAboutDialog() }
         dialog = AlertDialog.Builder(this)
             .setTitle(R.string.browser_more)
             .setView(box)
             .show()
+    }
+
+    /**
+     * 关于弹窗(更多最后一项):版本号 + GitHub 仓库入口。
+     * 版本行点击复制「版本名(版本号)」;仓库行点击收起弹窗并在本应用新开标签页打开
+     * (与历史/收藏的「在新标签页打开」同款)。
+     */
+    private fun showAboutDialog() {
+        val info = runCatching { packageManager.getPackageInfo(packageName, 0) }.getOrNull()
+        val version = info?.versionName.orEmpty().ifBlank { "-" }
+        // longVersionCode 是 28+,26/27 读旧字段
+        val code = info?.let {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) it.longVersionCode else it.versionCode.toLong()
+        } ?: 0L
+        val versionText = getString(R.string.browser_about_version, version, code)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lateinit var dialog: AlertDialog
+        // 版本行:点击复制
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).text = versionText
+            setOnClickListener {
+                (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
+                    ?.setPrimaryClip(ClipData.newPlainText(null, versionText))
+                toast(R.string.browser_copied)
+            }
+        })
+        // 仓库行:点击收起弹窗,再新开标签页跳转
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_about_repo)
+            setOnClickListener {
+                dialog.dismiss()
+                openGitHubRepo()
+            }
+        })
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.browser_about)
+            .setView(box)
+            .show()
+    }
+
+    /** 关于里的 GitHub 仓库:当前就在仓库页则不动,已有相同标签切换过去,没有才新开 */
+    private fun openGitHubRepo() {
+        // 先看当前:当前标签就是仓库页(不管重开了几个同页标签),什么都不用动
+        if (tabs.getOrNull(currentIndex)?.url == GITHUB_URL) return
+        val existing = tabs.indexOfFirst { it.url == GITHUB_URL }
+        if (existing >= 0) {
+            showTab(existing, reveal = true)
+        } else {
+            addTab(shortHost(GITHUB_URL), GITHUB_URL)
+            showTab(tabs.lastIndex, reveal = true)
+        }
     }
 
     /** 当前是否夜间模式 */
@@ -5465,6 +5518,9 @@ class BrowserActivity : AppCompatActivity() {
 
     companion object {
         private const val MAX_TAB_TITLE_LENGTH = 12
+
+        /** GitHub 仓库地址(关于弹窗里点击新开标签页跳转) */
+        private const val GITHUB_URL = "https://github.com/landamao/browser"
 
         // 夜间模式在 LdmBrowserApp(Application)里也要读,故设 internal 供其引用
         internal const val PREFS_NAME = "ldmbrowser_settings"
