@@ -45,6 +45,8 @@ import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.util.Base64
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.SeekBar
 import android.widget.PopupWindow
 import android.widget.ScrollView
@@ -75,6 +77,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
+import androidx.appcompat.widget.AppCompatSpinner
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.ItemTouchHelper
@@ -123,7 +126,8 @@ import kotlin.math.roundToInt
  * - 前进后退走自管历史(每标签一份 url 列表,不用 WebView 原生历史):
  *   自管历史才能随会话持久化,重启后仍能按原顺序前进后退
  * - 设置弹窗:清除数据(四项数据范围勾选 + 「仅当前网站」作用域开关)、
- *   调换标签页和网址栏的位置、标签页和网址栏上下分布;点功能不关弹窗,弹窗逐层叠加,点空白处从最上层开始一层一层关闭
+ *   标签页和网址栏设置(二级弹窗里调换位置/上下分布)、下载设置(二级弹窗里
+ *   下载方式/下载目录下拉选择);点功能不关弹窗,弹窗逐层叠加,点空白处从最上层开始一层一层关闭
  * - 自定义主页:标题 + 链接;主页动作与新标签页都用它,未设置时不自动新建标签页,
  *   空状态下直接在地址栏输入网址即可新建标签页
  * - 电脑模式:桌面 UA + 强制宽布局视口(约 1280)+ 可缩放,让站点走桌面排版
@@ -136,7 +140,7 @@ import kotlin.math.roundToInt
  *   快捷输入条背景跟随面板透明度;长按面板空白边缘进入调节状态 —— 半透明黑覆盖 +
  *   白色边框线,拖边框实时改窗口大小(完成保存,取消还原)
  * - 内置下载器(LdmDownloader.kt,自研):网页请求下载文件不再跳系统浏览器。
- *   下载方式可在设置里选「内置下载器 / 系统下载器」(默认内置):
+ *   下载方式可在设置的「下载设置」里下拉选「内置下载器 / 系统下载器」(默认内置):
  *   内置 = 自研 HttpURLConnection 引擎,断点续传(Range+If-Range 校验)、最多
  *   3 个并发排队、网络错误自动重试、进度条+速度,存到设置的下载目录(默认公共
  *   「下载」目录,可选自定义目录),进程被杀标为已暂停可继续,通知栏进度/完成;
@@ -239,10 +243,10 @@ class BrowserActivity : AppCompatActivity() {
     /** 退出前保存(菜单开关,默认开):开=实时+退出时落盘完整会话,关=退出清档不恢复 */
     private var saveOnExit = true
 
-    /** 调换布局:标签页在网址栏上方(设置弹窗切换,持久化);上下分布时决定哪一行贴顶 */
+    /** 调换布局:标签页在网址栏上方(「标签页和网址栏设置」弹窗切换,持久化);上下分布时决定哪一行贴顶 */
     private var tabsOnTop = false
 
-    /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(设置弹窗切换,持久化) */
+    /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(「标签页和网址栏设置」弹窗切换,持久化) */
     private var urlBarBottom = false
 
     /** 标签栏隐藏(长按「菜单」/「全部标签页」切换,持久化;隐藏后省出整行屏幕) */
@@ -251,9 +255,9 @@ class BrowserActivity : AppCompatActivity() {
     /** 设置弹窗引用:宽度弹窗的「完成」要连它一起收 */
     private var settingsDialog: AlertDialog? = null
 
-    /** 设置弹窗里的下载方式/下载目录条目:改完即时刷新文案 */
-    private var downloadMethodItem: View? = null
-    private var downloadDirItem: View? = null
+    /** 下载设置弹窗里的目录下拉框:目录选择器返回后刷新选项与选中项 */
+    private var dlDirSpinner: AppCompatSpinner? = null
+    private var dlDirAdapter: ArrayAdapter<String>? = null
 
     /** 全部标签页弹窗引用(切走/关闭时收起) */
     private var popupRef: PopupWindow? = null
@@ -1796,8 +1800,8 @@ class BrowserActivity : AppCompatActivity() {
     }
 
     /**
-     * 设置弹窗:清除数据、调换标签页和输入框位置。
-     * 点功能项不关弹窗;「清除数据」弹窗叠加在本弹窗上面;点空白处 AlertDialog
+     * 设置弹窗:清除数据、标签页和网址栏设置、标签页宽度、快捷输入、下载设置。
+     * 点功能项不关弹窗;二级弹窗叠加在本弹窗上面;点空白处 AlertDialog
      * 默认只关最上面一层,实现一层一层关闭。
      */
     private fun showSettingsDialog() {
@@ -1807,12 +1811,8 @@ class BrowserActivity : AppCompatActivity() {
             setOnClickListener { confirmClearBrowserData() }
         })
         box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_swap_toolbar)
-            setOnClickListener { toggleTabsOnTop() }
-        })
-        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_url_bar_bottom)
-            setOnClickListener { toggleUrlBarBottom() }
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_toolbar_layout)
+            setOnClickListener { showToolbarLayoutDialog() }
         })
         box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_tab_width)
@@ -1822,16 +1822,10 @@ class BrowserActivity : AppCompatActivity() {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_quick)
             setOnClickListener { showQuickTokensDialog() }
         })
-        downloadMethodItem = layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).text = downloadMethodText()
-            setOnClickListener { showDownloadMethodDialog() }
-        }
-        box.addView(downloadMethodItem)
-        downloadDirItem = layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).text = downloadDirText()
-            setOnClickListener { showDownloadDirDialog() }
-        }
-        box.addView(downloadDirItem)
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_settings)
+            setOnClickListener { showDownloadSettingsDialog() }
+        })
         AlertDialog.Builder(this)
             .setTitle(R.string.browser_settings)
             .setView(box)
@@ -1842,66 +1836,165 @@ class BrowserActivity : AppCompatActivity() {
             }
     }
 
-    /** 设置项文案:当前下载方式 */
-    private fun downloadMethodText(): String =
-        getString(R.string.browser_dl_method) + ":" +
-            getString(
-                if (downloadMethod == DL_METHOD_BUILTIN) {
-                    R.string.browser_dl_method_builtin
-                } else {
-                    R.string.browser_dl_method_system
-                }
-            )
-
-    /** 设置项文案:当前下载目录 */
-    private fun downloadDirText(): String =
-        getString(R.string.browser_dl_dir) + ":" + downloadDirLabel(this)
-
-    /** 下载方式弹窗:内置下载器(自研,断点续传/暂停)或系统下载器 */
-    private fun showDownloadMethodDialog() {
-        val options = arrayOf(
-            getString(R.string.browser_dl_method_builtin),
-            getString(R.string.browser_dl_method_system)
-        )
-        val current = if (downloadMethod == DL_METHOD_BUILTIN) 0 else 1
-        AlertDialog.Builder(this)
-            .setTitle(R.string.browser_dl_method)
-            .setSingleChoiceItems(options, current) { dialog, which ->
-                downloadMethod = if (which == 0) DL_METHOD_BUILTIN else DL_METHOD_SYSTEM
-                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-                    .putInt(PREF_DL_METHOD, downloadMethod)
-                    .apply()
-                downloadMethodItem?.findViewById<TextView>(R.id.menu_item_text)?.text = downloadMethodText()
-                dialog.dismiss()
-            }
-            .setNegativeButton(R.string.cancel, null)
+    /**
+     * 标签页和网址栏设置弹窗(设置里的「标签页和网址栏设置」进入,叠在设置弹窗上面):
+     * 两个条目点一下立即生效并持久化;底部两个按钮 ——
+     * 「设置」= 只收本弹窗,回到设置弹窗继续调别的;「完成」= 连设置弹窗一起收掉。
+     */
+    private fun showToolbarLayoutDialog() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_swap_toolbar)
+            setOnClickListener { toggleTabsOnTop() }
+        })
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_url_bar_bottom)
+            setOnClickListener { toggleUrlBarBottom() }
+        })
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.browser_toolbar_layout)
+            .setView(box)
+            .setPositiveButton(R.string.done, null)
+            .setNeutralButton(R.string.browser_settings, null)
             .show()
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            // 设置:只收本弹窗,回到下面的设置弹窗
+            dialog.dismiss()
+        }
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            // 完成:连设置弹窗一起收
+            dialog.dismiss()
+            settingsDialog?.dismiss()
+        }
     }
 
     /**
-     * 下载目录弹窗:默认公共「下载」目录,或选自定义目录(SAF,全版本无需存储权限)。
-     * 自定义目录只对内置下载器与 blob/data 落盘生效;系统下载器固定写公共下载目录。
+     * 下载设置弹窗(设置里的「下载设置」进入,叠在设置弹窗上面):
+     * 下载方式、下载目录都是下拉选择,选中即生效并持久化;底部两个按钮 ——
+     * 「设置」= 只收本弹窗,回到设置弹窗继续调别的;「完成」= 连设置弹窗一起收掉。
      */
-    private fun showDownloadDirDialog() {
-        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_dir_default)
-            setOnClickListener {
+    private fun showDownloadSettingsDialog() {
+        val density = resources.displayMetrics.density
+        val padH = (20 * density).toInt()
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, (8 * density).toInt())
+        }
+
+        fun rowLabel(textRes: Int): TextView = TextView(this).apply {
+            textSize = 16f
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.on_surface))
+            setPadding(padH, (16 * density).toInt(), padH, 0)
+            setText(textRes)
+        }
+
+        fun rowSpinner(): AppCompatSpinner = AppCompatSpinner(this).also { sp ->
+            box.addView(
+                sp,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(padH, 0, padH, 0) }
+            )
+        }
+
+        // 下载方式下拉:内置下载器(自研,断点续传/暂停)/ 系统下载器
+        box.addView(rowLabel(R.string.browser_dl_method))
+        val methodSpinner = rowSpinner()
+        methodSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_item, arrayOf(
+                getString(R.string.browser_dl_method_builtin),
+                getString(R.string.browser_dl_method_system)
+            )
+        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        methodSpinner.setSelection(if (downloadMethod == DL_METHOD_BUILTIN) 0 else 1, false)
+        methodSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?, view: View?, position: Int, id: Long
+            ) {
+                val method = if (position == 0) DL_METHOD_BUILTIN else DL_METHOD_SYSTEM
+                if (method == downloadMethod) return  // 初始选中的回显,不是用户操作
+                downloadMethod = method
                 getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-                    .remove(LdmDownloader.PREF_DL_DIR)
+                    .putInt(PREF_DL_METHOD, method)
                     .apply()
-                updateDownloadDirItemText()
             }
-        })
-        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
-            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_dir_pick)
-            setOnClickListener { pickDownloadDir() }
-        })
-        AlertDialog.Builder(this)
-            .setTitle(R.string.browser_dl_dir)
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        // 下载目录下拉:默认「下载」;自定义后第二项显示所选路径,末项总是「选择自定义目录…」
+        box.addView(rowLabel(R.string.browser_dl_dir))
+        val dirSpinner = rowSpinner()
+        val dirAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, downloadDirOptions())
+            .apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+        dirSpinner.adapter = dirAdapter
+        dirSpinner.setSelection(if (hasCustomDownloadDir()) 1 else 0, false)
+        dirSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?, view: View?, position: Int, id: Long
+            ) {
+                val custom = hasCustomDownloadDir()
+                if (position == if (custom) 1 else 0) return  // 当前生效项的回显,不是用户操作
+                when {
+                    custom && position == 0 -> clearDownloadDir()
+                    else -> pickDownloadDir()
+                }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        dlDirSpinner = dirSpinner
+        dlDirAdapter = dirAdapter
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.browser_dl_settings)
             .setView(box)
-            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.done, null)
+            .setNeutralButton(R.string.browser_settings, null)
             .show()
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
+            // 设置:只收本弹窗,回到下面的设置弹窗
+            dialog.dismiss()
+        }
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+            // 完成:连设置弹窗一起收
+            dialog.dismiss()
+            settingsDialog?.dismiss()
+        }
+        dialog.setOnDismissListener {
+            dlDirSpinner = null
+            dlDirAdapter = null
+        }
+    }
+
+    /** 是否设置了自定义下载目录 */
+    private fun hasCustomDownloadDir(): Boolean =
+        !getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(LdmDownloader.PREF_DL_DIR, null).isNullOrBlank()
+
+    /** 下载目录下拉项:0=默认「下载」;自定义时追加所选路径,末项总是「选择自定义目录…」 */
+    private fun downloadDirOptions(): List<String> {
+        val options = mutableListOf(getString(R.string.browser_dl_dir_default))
+        if (hasCustomDownloadDir()) options.add(downloadDirLabel(this))
+        options.add(getString(R.string.browser_dl_dir_pick))
+        return options
+    }
+
+    /** 恢复默认下载目录:清掉自定义目录记录并刷新下拉框 */
+    private fun clearDownloadDir() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .remove(LdmDownloader.PREF_DL_DIR)
+            .apply()
+        refreshDownloadDirSpinner()
+    }
+
+    /** 目录下拉框按当前设置重建:选项与选中项都对齐到实际状态 */
+    private fun refreshDownloadDirSpinner() {
+        val spinner = dlDirSpinner ?: return
+        val adapter = dlDirAdapter ?: return
+        adapter.clear()
+        adapter.addAll(downloadDirOptions())
+        spinner.setSelection(if (hasCustomDownloadDir()) 1 else 0, false)
     }
 
     /** 唤起系统目录选择器(SAF),选中后持久化授权 */
@@ -1915,17 +2008,17 @@ class BrowserActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateDownloadDirItemText() {
-        downloadDirItem?.findViewById<TextView>(R.id.menu_item_text)?.text = downloadDirText()
-    }
-
-    /** 目录选择结果:拿到持久化读写授权后记下目录,设置项与确认弹窗文案跟着更新 */
+    /** 目录选择结果:拿到持久化读写授权后记下目录,下载设置弹窗的目录下拉框跟着刷新 */
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQ_PICK_DOWNLOAD_DIR) return
-        val treeUri = data?.data ?: return
-        if (resultCode != RESULT_OK) return
+        val treeUri = data?.data
+        if (resultCode != RESULT_OK || treeUri == null) {
+            // 取消选择:目录下拉框弹回当前生效项
+            refreshDownloadDirSpinner()
+            return
+        }
         runCatching {
             contentResolver.takePersistableUriPermission(
                 treeUri,
@@ -1935,7 +2028,7 @@ class BrowserActivity : AppCompatActivity() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putString(LdmDownloader.PREF_DL_DIR, treeUri.toString())
             .apply()
-        updateDownloadDirItemText()
+        refreshDownloadDirSpinner()
         toast(R.string.browser_dl_dir_set)
     }
 
@@ -2107,7 +2200,7 @@ class BrowserActivity : AppCompatActivity() {
         }
     }
 
-    /** 设置弹窗「调换标签页和网址栏的位置」:切换标签栏与工具栏行的上下位置并持久化 */
+    /** 「标签页和网址栏设置」弹窗「调换标签页和网址栏的位置」:切换标签栏与工具栏行的上下位置并持久化 */
     private fun toggleTabsOnTop() {
         tabsOnTop = !tabsOnTop
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -2117,7 +2210,7 @@ class BrowserActivity : AppCompatActivity() {
         applyLayoutOrder()
     }
 
-    /** 设置弹窗「标签页和网址栏上下分布」:两行分居屏幕顶/底并持久化 */
+    /** 「标签页和网址栏设置」弹窗「标签页和网址栏上下分布」:两行分居屏幕顶/底并持久化 */
     private fun toggleUrlBarBottom() {
         urlBarBottom = !urlBarBottom
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -5410,10 +5503,10 @@ class BrowserActivity : AppCompatActivity() {
         /** 完整会话存档:顺序/当前标签/标题与重命名/锁定/前进后退历史 */
         private const val PREF_SAVED_SESSION = "browser_saved_session"
 
-        /** 调换布局:标签页在地址栏上方(设置弹窗切换) */
+        /** 调换布局:标签页在地址栏上方(「标签页和网址栏设置」弹窗切换) */
         private const val PREF_TABS_ON_TOP = "tabs_on_top"
 
-        /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(设置弹窗切换) */
+        /** 上下分布:标签栏与网址栏整行分居屏幕顶/底(「标签页和网址栏设置」弹窗切换) */
         private const val PREF_URL_BAR_BOTTOM = "url_bar_bottom"
 
         /** 标签栏隐藏(长按「菜单」/「全部标签页」切换,持久化) */
@@ -5442,7 +5535,7 @@ class BrowserActivity : AppCompatActivity() {
         private const val PREF_DM_HIDDEN = "browser_dm_hidden"
         private const val MAX_DOWNLOAD_RECORDS = 300
 
-        /** 下载方式(设置弹窗切换,持久化):0=内置下载器(自研引擎) 1=系统下载器 */
+        /** 下载方式(「下载设置」弹窗下拉切换,持久化):0=内置下载器(自研引擎) 1=系统下载器 */
         internal const val PREF_DL_METHOD = "browser_dl_method"
         internal const val DL_METHOD_BUILTIN = 0
         internal const val DL_METHOD_SYSTEM = 1

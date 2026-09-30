@@ -97,6 +97,7 @@
     <string name="browser_dl_pause">暂停</string>
     <string name="browser_dl_resume">继续</string>
     <string name="browser_dl_resumed">已继续下载</string>
+    <string name="browser_dl_settings">下载设置</string>
     <string name="browser_dl_method">下载方式</string>
     <string name="browser_dl_method_builtin">内置下载器</string>
     <string name="browser_dl_method_system">系统下载器</string>
@@ -178,6 +179,7 @@
     <string name="browser_save_on_toast">退出前保存已开启:退出时保存标签页状态</string>
     <string name="browser_save_off_toast">退出前保存已关闭:下次打开不恢复标签页</string>
     <string name="browser_settings">设置</string>
+    <string name="browser_toolbar_layout">标签页和网址栏设置</string>
     <string name="browser_swap_toolbar">调换标签页和网址栏的位置</string>
     <string name="browser_url_bar_bottom">标签页和网址栏上下分布</string>
     <string name="browser_tab_width">标签页宽度</string>
