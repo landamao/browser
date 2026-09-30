@@ -252,9 +252,6 @@ class BrowserActivity : AppCompatActivity() {
     /** 标签栏隐藏(长按「菜单」/「全部标签页」切换,持久化;隐藏后省出整行屏幕) */
     private var tabBarHidden = false
 
-    /** 设置弹窗引用:宽度弹窗的「完成」要连它一起收 */
-    private var settingsDialog: AlertDialog? = null
-
     /** 下载设置弹窗里的目录下拉框:目录选择器返回后刷新选项与选中项 */
     private var dlDirSpinner: AppCompatSpinner? = null
     private var dlDirAdapter: ArrayAdapter<String>? = null
@@ -1830,16 +1827,11 @@ class BrowserActivity : AppCompatActivity() {
             .setTitle(R.string.browser_settings)
             .setView(box)
             .show()
-            .also { dialog ->
-                settingsDialog = dialog
-                dialog.setOnDismissListener { settingsDialog = null }
-            }
     }
 
     /**
      * 标签页和网址栏设置弹窗(设置里的「标签页和网址栏设置」进入,叠在设置弹窗上面):
-     * 两个条目点一下立即生效并持久化;底部两个按钮 ——
-     * 「设置」= 只收本弹窗,回到设置弹窗继续调别的;「完成」= 连设置弹窗一起收掉。
+     * 两个条目点一下立即生效并持久化;「完成」只收本弹窗,回到设置弹窗继续调别的。
      */
     private fun showToolbarLayoutDialog() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1851,27 +1843,17 @@ class BrowserActivity : AppCompatActivity() {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_url_bar_bottom)
             setOnClickListener { toggleUrlBarBottom() }
         })
-        val dialog = AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle(R.string.browser_toolbar_layout)
             .setView(box)
             .setPositiveButton(R.string.done, null)
-            .setNeutralButton(R.string.browser_settings, null)
             .show()
-        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            // 设置:只收本弹窗,回到下面的设置弹窗
-            dialog.dismiss()
-        }
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 完成:连设置弹窗一起收
-            dialog.dismiss()
-            settingsDialog?.dismiss()
-        }
     }
 
     /**
      * 下载设置弹窗(设置里的「下载设置」进入,叠在设置弹窗上面):
-     * 下载方式、下载目录都是下拉选择,选中即生效并持久化;底部两个按钮 ——
-     * 「设置」= 只收本弹窗,回到设置弹窗继续调别的;「完成」= 连设置弹窗一起收掉。
+     * 下载方式、下载目录都是下拉选择,选中即生效并持久化;
+     * 「完成」只收本弹窗,回到设置弹窗继续调别的。
      */
     private fun showDownloadSettingsDialog() {
         val density = resources.displayMetrics.density
@@ -1950,17 +1932,7 @@ class BrowserActivity : AppCompatActivity() {
             .setTitle(R.string.browser_dl_settings)
             .setView(box)
             .setPositiveButton(R.string.done, null)
-            .setNeutralButton(R.string.browser_settings, null)
             .show()
-        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            // 设置:只收本弹窗,回到下面的设置弹窗
-            dialog.dismiss()
-        }
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 完成:连设置弹窗一起收
-            dialog.dismiss()
-            settingsDialog?.dismiss()
-        }
         dialog.setOnDismissListener {
             dlDirSpinner = null
             dlDirAdapter = null
@@ -2034,8 +2006,7 @@ class BrowserActivity : AppCompatActivity() {
 
     /**
      * 标签页宽度弹窗(设置里的「标签页宽度」进入,叠在设置弹窗上面):
-     * 双点滑块拖动实时生效并保存;底部两个按钮 ——
-     * 「设置」= 只收本弹窗,回到设置弹窗继续调别的;「完成」= 连设置弹窗一起收掉。
+     * 双点滑块拖动实时生效并保存;「完成」只收本弹窗,回到设置弹窗继续调别的。
      */
     private fun showTabWidthDialog() {
         val density = resources.displayMetrics.density
@@ -2069,21 +2040,11 @@ class BrowserActivity : AppCompatActivity() {
                 renderBrowserTabs()
             }
         })
-        val dialog = AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle(R.string.browser_tab_width)
             .setView(box)
             .setPositiveButton(R.string.done, null)
-            .setNeutralButton(R.string.browser_settings, null)
             .show()
-        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.setOnClickListener {
-            // 设置:只收本弹窗,回到下面的设置弹窗
-            dialog.dismiss()
-        }
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            // 完成:连设置弹窗一起收
-            dialog.dismiss()
-            settingsDialog?.dismiss()
-        }
     }
 
     /** 宽度值文案:两值相同显示固定宽度 */
