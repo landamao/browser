@@ -61,9 +61,49 @@
     <string name="browser_home_need_setup">未设置主页:长按菜单里的「主页」设置,或直接在地址栏输入网址</string>
     <string name="browser_home_clear">清除</string>
 
-    <!-- 下载 -->
+    <!-- 下载:菜单入口、确认弹窗、列表页、引擎与设置 -->
+    <string name="browser_downloads">下载管理</string>
     <string name="browser_download_title">下载文件</string>
-    <string name="browser_download_message">网站请求下载文件,是否跳转到系统浏览器继续?</string>
+    <string name="browser_dl_confirm">「%1$s」将保存到「下载」目录,是否下载?</string>
+    <string name="browser_dl_confirm_size">「%1$s」(大小 %2$s)将保存到「下载」目录,是否下载?</string>
+    <string name="browser_dl_confirm_dir">「%1$s」将保存到「%2$s」,是否下载?</string>
+    <string name="browser_dl_confirm_size_dir">「%1$s」(大小 %2$s)将保存到「%3$s」,是否下载?</string>
+    <string name="browser_dl_start">开始下载</string>
+    <string name="browser_dl_started">已开始下载</string>
+    <string name="browser_dl_saved">已保存到「下载」目录</string>
+    <string name="browser_dl_failed">下载失败</string>
+    <string name="browser_dl_empty">暂无下载</string>
+    <string name="browser_dl_search_hint">搜索下载记录</string>
+    <string name="browser_dl_search_empty">无匹配结果</string>
+    <string name="browser_dl_status_running">下载中</string>
+    <string name="browser_dl_status_waiting">等待中</string>
+    <string name="browser_dl_status_paused">已暂停</string>
+    <string name="browser_dl_status_done">已完成</string>
+    <string name="browser_dl_status_failed">下载失败</string>
+    <string name="browser_dl_status_saved">已保存</string>
+    <string name="browser_dl_open">打开</string>
+    <string name="browser_dl_delete">删除</string>
+    <string name="browser_dl_deleted">已删除</string>
+    <string name="browser_dl_copy_link">复制来源链接</string>
+    <string name="browser_dl_copy_path">复制文件路径</string>
+    <string name="browser_dl_path_copied">已复制文件路径</string>
+    <string name="browser_dl_open_fail">无法打开该文件</string>
+    <string name="browser_dl_in_progress">该文件还在下载中</string>
+    <string name="browser_dl_open_with">选择打开方式</string>
+    <string name="browser_dl_pause">暂停</string>
+    <string name="browser_dl_resume">继续</string>
+    <string name="browser_dl_resumed">已继续下载</string>
+    <string name="browser_dl_method">下载方式</string>
+    <string name="browser_dl_method_builtin">内置下载器</string>
+    <string name="browser_dl_method_system">系统下载器</string>
+    <string name="browser_dl_dir">下载目录</string>
+    <string name="browser_dl_dir_default">默认(系统「下载」目录)</string>
+    <string name="browser_dl_dir_default_name">下载</string>
+    <string name="browser_dl_dir_pick">选择自定义目录…</string>
+    <string name="browser_dl_dir_set">已设置下载目录</string>
+    <string name="browser_dl_dir_pick_fail">无法打开目录选择器</string>
+    <string name="browser_dl_notif_channel">下载通知</string>
+    <string name="browser_dl_notif_done">下载完成</string>
 
     <!-- 网页请求打开外部应用:确认弹窗(屏幕靠下方显示) -->
     <string name="browser_open_app_title">打开外部应用</string>

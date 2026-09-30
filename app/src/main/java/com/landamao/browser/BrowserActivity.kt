@@ -3,6 +3,7 @@ package com.landamao.browser
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.app.DownloadManager
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -10,7 +11,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.Manifest
 import android.content.res.Configuration
+import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -19,7 +22,11 @@ import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.TextUtils
@@ -36,11 +43,14 @@ import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.util.Base64
 import android.widget.SeekBar
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -65,6 +75,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -72,11 +83,14 @@ import com.google.android.material.tabs.TabLayout
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -120,6 +134,16 @@ import kotlin.math.roundToInt
  *   「提取链接」抓出正文网址列表(每条可复制 / 在新标签页访问);
  *   快捷输入条背景跟随面板透明度;长按面板空白边缘进入调节状态 —— 半透明黑覆盖 +
  *   白色边框线,拖边框实时改窗口大小(完成保存,取消还原)
+ * - 内置下载器(LdmDownloader.kt,自研):网页请求下载文件不再跳系统浏览器。
+ *   下载方式可在设置里选「内置下载器 / 系统下载器」(默认内置):
+ *   内置 = 自研 HttpURLConnection 引擎,断点续传(Range+If-Range 校验)、最多
+ *   3 个并发排队、网络错误自动重试、进度条+速度,存到设置的下载目录(默认公共
+ *   「下载」目录,可选自定义目录),进程被杀标为已暂停可继续,通知栏进度/完成;
+ *   系统 = 系统 DownloadManager(带 Cookie/UA/Referer,固定存公共「下载」目录)
+ *   blob:/data: 没有可下载地址,由页面 JS 分片转 base64 过 JS 桥原生落盘,
+ *   同样存到设置的下载目录(Android 10+ 入 MediaStore「下载」,旧版入应用专属目录);
+ *   菜单「下载管理」开列表页:点条目已完成唤起「打开方式」,长按暂停/继续/
+ *   打开/复制来源链接/复制文件路径/删除,进度实时刷新
  * - 注册了 ACTION_VIEW http/https,可作为系统「打开方式」里的浏览器
  */
 class BrowserActivity : AppCompatActivity() {
@@ -226,6 +250,10 @@ class BrowserActivity : AppCompatActivity() {
     /** 设置弹窗引用:宽度弹窗的「完成」要连它一起收 */
     private var settingsDialog: AlertDialog? = null
 
+    /** 设置弹窗里的下载方式/下载目录条目:改完即时刷新文案 */
+    private var downloadMethodItem: View? = null
+    private var downloadDirItem: View? = null
+
     /** 全部标签页弹窗引用(切走/关闭时收起) */
     private var popupRef: PopupWindow? = null
 
@@ -254,6 +282,21 @@ class BrowserActivity : AppCompatActivity() {
 
     /** 标题先于页面提交到达时的暂存(提交记录时带上,避免历史条目只剩网址) */
     private val pendingVisitTitles = mutableMapOf<String, String>()
+
+    /** 下载管理页进度观察者(系统下载变化时去抖推送刷新;onCreate 注册,onDestroy 摘除) */
+    private var downloadsObserver: ContentObserver? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val downloadsRefreshRunnable = Runnable { pushDownloadsData() }
+
+    /** 下载方式:内置下载器(自研引擎)或系统下载器(设置弹窗切换,持久化) */
+    private var downloadMethod = DL_METHOD_BUILTIN
+
+    /** 自研下载引擎(应用级单例,设置变化回调切回主线程去抖推送下载管理页) */
+    private val downloader: LdmDownloader
+        get() = LdmDownloader.get(applicationContext)
+
+    /** blob 分片接收中的任务:key → 名称/类型/临时文件/输出流(JavaBridge 线程写,主线程收尾) */
+    private val blobTasks = ConcurrentHashMap<String, BlobTask>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // 夜间模式:LdmBrowserApp 已在 Activity attach 前应用,此处兜底重设(相同值时为空操作);
@@ -292,9 +335,10 @@ class BrowserActivity : AppCompatActivity() {
                 tab.history.clear()
                 tab.history.addAll(saved.history)
                 tab.historyIndex = saved.historyIndex
-                // 历史记录/收藏页内容不靠 loadUrl,恢复后要主动渲染
+                // 历史记录/收藏/下载管理页内容不靠 loadUrl,恢复后要主动渲染
                 if (current == HISTORY_URL) loadHistoryPageInto(tab)
                 if (current == BOOKMARKS_URL) loadBookmarksPageInto(tab)
+                if (current == DOWNLOADS_URL) loadDownloadsPageInto(tab)
                 addTab(saved.customTitle ?: tab.title, current, tab)
             }
             showTab(session.index.coerceIn(0, tabs.lastIndex))
@@ -313,7 +357,14 @@ class BrowserActivity : AppCompatActivity() {
             }
         })
 
+        // 下载方式设置 + 自研下载引擎回调:引擎状态变化 → 开着的下载管理页去抖刷新
+        downloadMethod = prefs.getInt(PREF_DL_METHOD, DL_METHOD_BUILTIN)
+        downloader.onUpdate = { mainHandler.post { scheduleDownloadsRefresh() } }
+
         handleIntent(intent)
+
+        // 系统下载进度变化 → 开着的下载管理页去抖实时刷新
+        registerDownloadsObserver()
     }
 
     /**
@@ -417,7 +468,7 @@ class BrowserActivity : AppCompatActivity() {
             if (tabBarHidden) {
                 tabs.getOrNull(currentIndex)?.let { tab ->
                     if (hasFocus) {
-                        if (!isHistoryTab(tab) && !isBookmarksTab(tab)) {
+                        if (!isHistoryTab(tab) && !isBookmarksTab(tab) && !isDownloadsTab(tab)) {
                             addressBar.setText(tab.url)
                             addressBar.setSelection(0, addressBar.text?.length ?: 0)
                         }
@@ -628,8 +679,11 @@ class BrowserActivity : AppCompatActivity() {
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     val url = o.optString("url")
-                    // 历史记录页/收藏页是 about: 虚拟地址,也随会话保存
-                    if (url != HISTORY_URL && url != BOOKMARKS_URL && !isWebUrl(url)) continue
+                    // 历史记录页/收藏页/下载管理页是 about: 虚拟地址,也随会话保存
+                    if (
+                        url != HISTORY_URL && url != BOOKMARKS_URL &&
+                        url != DOWNLOADS_URL && !isWebUrl(url)
+                    ) continue
                     val history = mutableListOf<String>()
                     o.optJSONArray("history")?.let { ha ->
                         for (j in 0 until ha.length()) {
@@ -688,6 +742,11 @@ class BrowserActivity : AppCompatActivity() {
      * 普通启动(MAIN,无数据)不做任何事。
      */
     private fun handleIntent(intent: Intent?) {
+        // 下载通知点击:只聚焦下载管理页,不带网址
+        if (intent?.getBooleanExtra(LdmDownloader.EXTRA_OPEN_DOWNLOADS, false) == true) {
+            openDownloadsTab()
+            return
+        }
         val uri = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data ?: return
         when (uri.scheme?.lowercase(Locale.ROOT)) {
             "http", "https", "file" -> focusOrCreateTab(uri.toString())
@@ -838,7 +897,7 @@ class BrowserActivity : AppCompatActivity() {
 
     /** 地址栏浏览态文本:隐藏标签栏时显示页面标题(编辑态才换回网址),虚拟页留空 */
     private fun addressBrowseText(tab: TabItem): String = when {
-        isHistoryTab(tab) || isBookmarksTab(tab) -> ""
+        isHistoryTab(tab) || isBookmarksTab(tab) || isDownloadsTab(tab) -> ""
         tabBarHidden -> displayTitle(tab)
         else -> tab.url
     }
@@ -876,6 +935,7 @@ class BrowserActivity : AppCompatActivity() {
             ),
             BrowserMenuAction(getString(R.string.browser_bookmark), action = { openBookmarksTab() }),
             BrowserMenuAction(getString(R.string.browser_history), action = { openHistoryTab() }),
+            BrowserMenuAction(getString(R.string.browser_downloads), action = { openDownloadsTab() }),
             BrowserMenuAction(getString(R.string.browser_note), action = { showTextEditor() }),
             BrowserMenuAction(
                 getString(if (saveOnExit) R.string.browser_save_on else R.string.browser_save_off),
@@ -1757,6 +1817,16 @@ class BrowserActivity : AppCompatActivity() {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_quick)
             setOnClickListener { showQuickTokensDialog() }
         })
+        downloadMethodItem = layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).text = downloadMethodText()
+            setOnClickListener { showDownloadMethodDialog() }
+        }
+        box.addView(downloadMethodItem)
+        downloadDirItem = layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).text = downloadDirText()
+            setOnClickListener { showDownloadDirDialog() }
+        }
+        box.addView(downloadDirItem)
         AlertDialog.Builder(this)
             .setTitle(R.string.browser_settings)
             .setView(box)
@@ -1765,6 +1835,103 @@ class BrowserActivity : AppCompatActivity() {
                 settingsDialog = dialog
                 dialog.setOnDismissListener { settingsDialog = null }
             }
+    }
+
+    /** 设置项文案:当前下载方式 */
+    private fun downloadMethodText(): String =
+        getString(R.string.browser_dl_method) + ":" +
+            getString(
+                if (downloadMethod == DL_METHOD_BUILTIN) {
+                    R.string.browser_dl_method_builtin
+                } else {
+                    R.string.browser_dl_method_system
+                }
+            )
+
+    /** 设置项文案:当前下载目录 */
+    private fun downloadDirText(): String =
+        getString(R.string.browser_dl_dir) + ":" + downloadDirLabel(this)
+
+    /** 下载方式弹窗:内置下载器(自研,断点续传/暂停)或系统下载器 */
+    private fun showDownloadMethodDialog() {
+        val options = arrayOf(
+            getString(R.string.browser_dl_method_builtin),
+            getString(R.string.browser_dl_method_system)
+        )
+        val current = if (downloadMethod == DL_METHOD_BUILTIN) 0 else 1
+        AlertDialog.Builder(this)
+            .setTitle(R.string.browser_dl_method)
+            .setSingleChoiceItems(options, current) { dialog, which ->
+                downloadMethod = if (which == 0) DL_METHOD_BUILTIN else DL_METHOD_SYSTEM
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putInt(PREF_DL_METHOD, downloadMethod)
+                    .apply()
+                downloadMethodItem?.findViewById<TextView>(R.id.menu_item_text)?.text = downloadMethodText()
+                dialog.dismiss()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 下载目录弹窗:默认公共「下载」目录,或选自定义目录(SAF,全版本无需存储权限)。
+     * 自定义目录只对内置下载器与 blob/data 落盘生效;系统下载器固定写公共下载目录。
+     */
+    private fun showDownloadDirDialog() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_dir_default)
+            setOnClickListener {
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .remove(LdmDownloader.PREF_DL_DIR)
+                    .apply()
+                updateDownloadDirItemText()
+            }
+        })
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_dir_pick)
+            setOnClickListener { pickDownloadDir() }
+        })
+        AlertDialog.Builder(this)
+            .setTitle(R.string.browser_dl_dir)
+            .setView(box)
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /** 唤起系统目录选择器(SAF),选中后持久化授权 */
+    private fun pickDownloadDir() {
+        try {
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_PICK_DOWNLOAD_DIR
+            )
+        } catch (_: Exception) {
+            toast(R.string.browser_dl_dir_pick_fail)
+        }
+    }
+
+    private fun updateDownloadDirItemText() {
+        downloadDirItem?.findViewById<TextView>(R.id.menu_item_text)?.text = downloadDirText()
+    }
+
+    /** 目录选择结果:拿到持久化读写授权后记下目录,设置项与确认弹窗文案跟着更新 */
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_PICK_DOWNLOAD_DIR) return
+        val treeUri = data?.data ?: return
+        if (resultCode != RESULT_OK) return
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        }
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(LdmDownloader.PREF_DL_DIR, treeUri.toString())
+            .apply()
+        updateDownloadDirItemText()
+        toast(R.string.browser_dl_dir_set)
     }
 
     /**
@@ -2416,28 +2583,11 @@ class BrowserActivity : AppCompatActivity() {
         }
         applyDesktopMode(wv)
 
-        // 网页请求下载文件:内置 WebView 不做下载管理,提示跳转系统浏览器
-        wv.setDownloadListener { url, _, _, _, _ ->
+        // 网页请求下载文件:内置下载器接管 —— blob:/data: 原生落盘,
+        // http(s) 确认后交系统 DownloadManager,其余 scheme 转交外部应用
+        wv.setDownloadListener { url, ua, disposition, mimeType, contentLength ->
             if (url.isNullOrBlank() || isFinishing || isDestroyed) return@setDownloadListener
-            try {
-                AlertDialog.Builder(this)
-                    .setTitle(R.string.browser_download_title)
-                    .setMessage(R.string.browser_download_message)
-                    .setPositiveButton(R.string.confirm) { _, _ ->
-                        try {
-                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                        } catch (_: Exception) {
-                            android.widget.Toast.makeText(
-                                this,
-                                R.string.browser_no_browser,
-                                android.widget.Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    }
-                    .setNegativeButton(R.string.cancel, null)
-                    .show()
-            } catch (_: Exception) {
-            }
+            handleDownloadRequest(wv, url, ua, disposition, mimeType, contentLength)
         }
 
         wv.webViewClient = object : WebViewClient() {
@@ -2479,6 +2629,8 @@ class BrowserActivity : AppCompatActivity() {
                 }
                 // 尽早注入,减少 SPA 先按手机宽度初始化
                 injectDesktopLayout(view)
+                // blob 下载文件名钩子:捕获 <a download href="blob:..."> 的文件名
+                injectBlobDownloadHook(view)
                 updateToolbarState()
             }
 
@@ -2493,6 +2645,7 @@ class BrowserActivity : AppCompatActivity() {
                 }
                 rememberNavigableUrl(view, url)
                 injectDesktopLayout(view)
+                injectBlobDownloadHook(view)
                 val index = tabs.indexOfFirst { it.webView == view }
                 if (index == currentIndex && index >= 0) {
                     if (isInternalOrBlankUrl(url)) {
@@ -2616,9 +2769,12 @@ class BrowserActivity : AppCompatActivity() {
             }
         }
         // 历史记录/收藏页等虚拟地址不在这里 load(由调用方 loadDataWithBaseURL 填充)
-        // 历史记录页挂 JS 桥:长按菜单 / 多选删除;收藏页挂桥:长按菜单
+        // 历史记录页挂 JS 桥:长按菜单 / 多选删除;收藏页挂桥:长按菜单;
+        // 下载管理页挂桥:点条目打开 / 长按菜单;blob 桥挂所有页面(下载请求到达时钩子已就位)
         if (url == HISTORY_URL) wv.addJavascriptInterface(HistoryBridge(), "LdmHistory")
         if (url == BOOKMARKS_URL) wv.addJavascriptInterface(BookmarksBridge(), "LdmBookmarks")
+        if (url == DOWNLOADS_URL) wv.addJavascriptInterface(DownloadsBridge(), "LdmDownloads")
+        wv.addJavascriptInterface(BlobBridge(), "LdmBlob")
         if (isWebUrl(url)) wv.loadUrl(url)
         // 记录触摸时刻(不消费事件):外部 scheme 打不开时,只有手势触发的才提示
         wv.setOnTouchListener { _, _ ->
@@ -2669,8 +2825,9 @@ class BrowserActivity : AppCompatActivity() {
         val live = wv.url
         addressBar.setText(
             when {
-                // 虚拟页(历史记录/收藏)地址栏留空
-                isHistoryTab(tabs[index]) || isBookmarksTab(tabs[index]) -> ""
+                // 虚拟页(历史记录/收藏/下载管理)地址栏留空
+                isHistoryTab(tabs[index]) || isBookmarksTab(tabs[index]) ||
+                    isDownloadsTab(tabs[index]) -> ""
                 // 隐藏标签栏:浏览态显示页面标题(该标签正在加载则显示网址),编辑态才换回网址
                 tabBarHidden -> if (tabs[index].isLoading) (live ?: tabs[index].url)
                 else displayTitle(tabs[index])
@@ -2682,6 +2839,9 @@ class BrowserActivity : AppCompatActivity() {
         progressBar.visibility = if (tabs[index].isLoading) View.VISIBLE else View.GONE
         syncErrorOverlay(tabs[index])
         updateToolbarState()
+        // 切到下载管理页立即推送最新数据:引擎空闲时没有回调,
+        // 不推的话页面停留在外面操作期间(下载完成/删除)的旧内容
+        if (isDownloadsTab(tabs[index])) pushDownloadsData()
         if (reveal) revealCurrentTab()
     }
 
@@ -2902,11 +3062,21 @@ class BrowserActivity : AppCompatActivity() {
         tab.errorDetail = ""
         if (tabs.getOrNull(currentIndex) === tab) {
             errorOverlay.visibility = View.GONE
-            addressBar.setText(if (url == HISTORY_URL || url == BOOKMARKS_URL) "" else url)
+            addressBar.setText(
+                if (url == HISTORY_URL || url == BOOKMARKS_URL || url == DOWNLOADS_URL) "" else url
+            )
         }
         tab.webView.stopLoading()
         markLoading(tab)
-        if (url == HISTORY_URL) loadHistoryPageInto(tab) else tab.webView.loadUrl(url)
+        if (url == HISTORY_URL) {
+            loadHistoryPageInto(tab)
+        } else if (url == BOOKMARKS_URL) {
+            loadBookmarksPageInto(tab)
+        } else if (url == DOWNLOADS_URL) {
+            loadDownloadsPageInto(tab)
+        } else {
+            tab.webView.loadUrl(url)
+        }
         updateToolbarState()
     }
 
@@ -2981,13 +3151,17 @@ class BrowserActivity : AppCompatActivity() {
      */
     private fun forceRefreshCurrent() {
         val tab = tabs.getOrNull(currentIndex) ?: return
-        // 虚拟页(历史记录/收藏):重新生成 HTML 即为刷新
+        // 虚拟页(历史记录/收藏/下载管理):重新生成 HTML 即为刷新
         if (isHistoryTab(tab)) {
             loadHistoryPageInto(tab)
             return
         }
         if (isBookmarksTab(tab)) {
             loadBookmarksPageInto(tab)
+            return
+        }
+        if (isDownloadsTab(tab)) {
+            loadDownloadsPageInto(tab)
             return
         }
         if (tab.showingErrorPage) {
@@ -3024,6 +3198,10 @@ class BrowserActivity : AppCompatActivity() {
         }
         if (isBookmarksTab(tab)) {
             loadBookmarksPageInto(tab)
+            return
+        }
+        if (isDownloadsTab(tab)) {
+            loadDownloadsPageInto(tab)
             return
         }
         if (tab.showingErrorPage || isInternalOrBlankUrl(tab.webView.url)) {
@@ -3900,6 +4078,942 @@ class BrowserActivity : AppCompatActivity() {
         }
     }
 
+    // ---------- 内置下载器 ----------
+
+    /**
+     * 下载(LdmDownloader.kt 为自研引擎,这里只做 UI 编排):
+     * - http(s) 按设置的下载方式分发:内置 = 自研引擎(断点续传/暂停/并发/通知),
+     *   系统 = DownloadManager;确认弹窗带文件名/大小/目标目录
+     * - blob:/data: 没有可直接下载的地址:页面 JS fetch 内容、按 1MB 分片转 base64 过
+     *   JS 桥(BlobBridge),原生拼成临时文件再落盘(与引擎共用 commitDownloadFile,
+     *   同样存到设置的下载目录)
+     * - 下载管理页(about:downloads,虚拟地址同历史/收藏页)合并展示引擎任务、系统下载与
+     *   blob/data 落盘记录:点条目已完成唤起「打开方式」,长按暂停/继续/打开/复制来源链接/
+     *   复制文件路径/删除;引擎进度与系统下载 ContentObserver 都去抖后增量刷新当前页
+     */
+    private class BlobTask(
+        val name: String,
+        var mime: String,
+        val file: File,
+        val stream: FileOutputStream
+    )
+
+    /** 一条下载条目(引擎任务/系统下载/blob·data 落盘记录),渲染成下载管理页的行 */
+    private class DownloadItem(
+        val id: String,        // "ldm-<引擎任务 id>" / "dm-<系统下载 id>" 或 "nat-<落盘记录 id>"
+        val name: String,
+        val kind: String,      // running|waiting|paused|failed|done|saved
+        val status: String,    // 状态文案(含进度/大小)
+        val time: Long,
+        val sourceUrl: String?,// 来源链接(长按可复制)
+        val path: String? = null,   // 已完成文件的路径(长按可复制)
+        val pct: Int = -1      // 下载进度 0-100;-1=未知/无进度条
+    )
+
+    /** blob/data 落盘记录(MediaStore 内容地址或应用专属目录路径) */
+    private class SavedFile(
+        val id: Long,
+        val uri: String,   // MediaStore 内容地址(29+);空串表示走 [path]
+        val path: String?, // 应用专属目录文件路径(≤28),打开走 FileProvider
+        val name: String,
+        val mime: String,
+        val size: Long,
+        val time: Long
+    )
+
+    private fun isDownloadsTab(item: TabItem) = item.url == DOWNLOADS_URL
+
+    private fun loadDownloadsPageInto(tab: TabItem) {
+        tab.webView.loadDataWithBaseURL(
+            null, buildDownloadsHtml(), "text/html", "utf-8", DOWNLOADS_URL
+        )
+    }
+
+    /** 菜单「下载管理」:以标签页方式打开;已开着就聚焦并按最新数据重渲染 */
+    private fun openDownloadsTab() {
+        val existing = tabs.indexOfFirst { isDownloadsTab(it) }
+        if (existing >= 0) {
+            loadDownloadsPageInto(tabs[existing])
+            showTab(existing, reveal = true)
+            return
+        }
+        val tab = TabItem(
+            getString(R.string.browser_downloads), DOWNLOADS_URL, createWebView(DOWNLOADS_URL)
+        )
+        loadDownloadsPageInto(tab)
+        addTab(getString(R.string.browser_downloads), DOWNLOADS_URL, tab)
+        showTab(tabs.lastIndex, reveal = true)
+    }
+
+    /** 重新渲染当前开着的下载管理页(记录变化后调用;系统下载进度走增量推送不走这里) */
+    private fun reloadDownloadsPage() {
+        tabs.firstOrNull { isDownloadsTab(it) }?.let { loadDownloadsPageInto(it) }
+    }
+
+    /** 大小的人类可读格式:0 以下返回空串(大小未知),1KB 起带一位小数 */
+    private fun formatBytes(bytes: Long): String {
+        if (bytes <= 0) return ""
+        val units = arrayOf("B", "KB", "MB", "GB")
+        var value = bytes.toDouble()
+        var unit = 0
+        while (value >= 1024 && unit < units.lastIndex) {
+            value /= 1024
+            unit++
+        }
+        val pattern = if (unit == 0) "%.0f%s" else "%.1f%s"
+        return String.format(Locale.US, pattern, value, units[unit])
+    }
+
+    /**
+     * DownloadListener 分发:blob:/data: 原生落盘,http(s) 确认后交系统下载器,
+     * 其余(file:// 等,极罕见)保留跳外部应用的老行为。
+     */
+    private fun handleDownloadRequest(
+        wv: WebView,
+        url: String,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+        contentLength: Long
+    ) {
+        when {
+            url.startsWith("blob:", ignoreCase = true) -> startBlobDownload(wv, url, mimeType)
+            url.startsWith("data:", ignoreCase = true) -> saveDataUriDownload(url, mimeType)
+            url.startsWith("http://", true) || url.startsWith("https://", true) ->
+                confirmHttpDownload(wv, url, userAgent, contentDisposition, mimeType, contentLength)
+            else -> openDownloadUrlExternally(url)
+        }
+    }
+
+    /** 下载器不可用时的老行为兜底:交给系统里的其他应用打开 */
+    private fun openDownloadUrlExternally(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Exception) {
+            toast(R.string.browser_no_browser)
+        }
+    }
+
+    /**
+     * http(s) 下载:确认文件名/大小/保存目录后按设置的下载方式入队 ——
+     * 内置下载器(自研引擎,断点续传/暂停/并发排队)或系统下载器
+     * (固定存公共「下载」目录,自定义下载目录对它不生效)。
+     */
+    private fun confirmHttpDownload(
+        wv: WebView,
+        url: String,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+        contentLength: Long
+    ) {
+        val name = guessDownloadName(url, contentDisposition, mimeType)
+        val sizeText = formatBytes(contentLength)
+        val builtin = downloadMethod == DL_METHOD_BUILTIN
+        val dirName = if (builtin) {
+            downloadDirLabel(this)
+        } else {
+            getString(R.string.browser_dl_dir_default_name)
+        }
+        val message = if (sizeText.isEmpty()) {
+            getString(R.string.browser_dl_confirm_dir, name, dirName)
+        } else {
+            getString(R.string.browser_dl_confirm_size_dir, name, sizeText, dirName)
+        }
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.browser_download_title)
+                .setMessage(message)
+                .setPositiveButton(R.string.browser_dl_start) { _, _ ->
+                    if (builtin) {
+                        ensureNotificationPermission()
+                        downloader.enqueue(url, userAgent, wv.url, name, mimeType)
+                    } else {
+                        enqueueHttpDownload(wv, url, userAgent, name, mimeType)
+                    }
+                    toast(R.string.browser_dl_started)
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 通知权限(13+):首次用内置下载器时请求;不授予也不影响下载,页面里照样有进度 */
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) return
+        runCatching {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_POST_NOTIFICATIONS)
+        }
+    }
+
+    /**
+     * 系统下载器(设置的「下载方式=系统下载器」时用):Cookie/UA/Referer 一并带上
+     * (登录后的下载、防盗链都依赖),固定存公共「下载」目录;入队失败
+     * (个别 ROM 裁掉下载器)退回外部应用打开。
+     */
+    private fun enqueueHttpDownload(
+        wv: WebView,
+        url: String,
+        userAgent: String?,
+        name: String,
+        mimeType: String?
+    ) {
+        try {
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                val cookies = CookieManager.getInstance().getCookie(url)
+                if (!cookies.isNullOrBlank()) addRequestHeader("Cookie", cookies)
+                if (!userAgent.isNullOrBlank()) addRequestHeader("User-Agent", userAgent)
+                val referer = wv.url
+                if (!referer.isNullOrBlank()) addRequestHeader("Referer", referer)
+                setTitle(name)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+            }
+            (getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager)?.enqueue(request)
+            toast(R.string.browser_dl_started)
+        } catch (_: Exception) {
+            openDownloadUrlExternally(url)
+        }
+    }
+
+    /** 下载文件名:优先 Content-Disposition(含 RFC5987 filename*),否则系统猜测,统一去非法字符 */
+    private fun guessDownloadName(url: String, contentDisposition: String?, mimeType: String?): String {
+        if (!contentDisposition.isNullOrBlank()) {
+            Regex("filename\\*=(?:UTF-8|utf-8)''([^;]+)").find(contentDisposition)
+                ?.groupValues?.get(1)?.let { encoded ->
+                    val decoded = runCatching { URLDecoder.decode(encoded, "UTF-8") }.getOrNull() ?: encoded
+                    return sanitizeFileName(decoded.trim().trim('"'))
+                }
+            Regex("filename=\"?([^\";]+)").find(contentDisposition)?.groupValues?.get(1)?.let {
+                return sanitizeFileName(it.trim())
+            }
+        }
+        val guessed = runCatching {
+            URLUtil.guessFileName(url, contentDisposition, mimeType)
+        }.getOrNull().orEmpty()
+        return sanitizeFileName(guessed)
+    }
+
+    /** 文件名统一清洗:去掉路径分隔符等非法字符(公共下载目录不允许子目录) */
+    private fun sanitizeFileName(name: String): String =
+        name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "download" }
+
+    /**
+     * blob: 下载:blob 是页面内存对象,监听器拿不到内容。先读页面钩子
+     * (见 injectBlobDownloadHook)记录的 <a download> 文件名并清空,确认后让页面
+     * fetch 内容分片回传(见 BlobBridge)。文件名拿不到时按 mime 推扩展名兜底。
+     */
+    private fun startBlobDownload(wv: WebView, blobUrl: String, mimeType: String?) {
+        // 读取后立即清空,避免下一个 blob 下载误用旧文件名
+        wv.evaluateJavascript("var n=window.__ldmBlobName||'';window.__ldmBlobName='';n") { value ->
+            val hooked = runCatching {
+                value?.trim()
+                    ?.removeSurrounding("\"")
+                    ?.replace("\\\"", "\"")
+                    ?.replace("\\\\", "\\")
+            }.getOrNull().orEmpty()
+            val ext = runCatching {
+                MimeTypeMap.getSingleton()
+                    .getExtensionFromMimeType(mimeType?.takeIf { it.isNotBlank() })
+            }.getOrNull() ?: "bin"
+            val fallback = "download_" +
+                SimpleDateFormat("HHmmss", Locale.getDefault()).format(Date()) + "." + ext
+            val name = sanitizeFileName(hooked.ifBlank { fallback })
+            try {
+                AlertDialog.Builder(this)
+                    .setTitle(R.string.browser_download_title)
+                    .setMessage(getString(R.string.browser_dl_confirm, name))
+                    .setPositiveButton(R.string.browser_dl_start) { _, _ ->
+                        fetchBlobIntoNative(wv, blobUrl, name, mimeType)
+                    }
+                    .setNegativeButton(R.string.cancel, null)
+                    .show()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 让页面 fetch blob 内容按 1MB 分片转 base64 回传;先建好接收任务再注入脚本 */
+    private fun fetchBlobIntoNative(wv: WebView, blobUrl: String, name: String, mimeType: String?) {
+        val key = System.currentTimeMillis().toString() + "_" + (0..9999).random()
+        val temp = File(cacheDir, "ldm_blob_$key.bin")
+        val stream = runCatching { FileOutputStream(temp) }.getOrNull() ?: run {
+            toast(R.string.browser_dl_failed)
+            return
+        }
+        blobTasks[key] = BlobTask(name, mimeType.orEmpty(), temp, stream)
+        val js = "(function(){var K='$key',U=" + JSONObject.quote(blobUrl) + ";" +
+            "var B=window.LdmBlob;if(!B){return;}" +
+            "fetch(U).then(function(r){return r.blob();}).then(function(b){" +
+            "try{B.onMeta(K,b.type||'');}catch(e){}" +
+            "var STEP=$DOWNLOAD_BLOB_CHUNK_BYTES,off=0;" +
+            "function next(){" +
+            "if(off>=b.size){try{B.onEnd(K,b.size);}catch(e){}return;}" +
+            "var fr=new FileReader();" +
+            "fr.onload=function(){var s=String(fr.result),i=s.indexOf(',');" +
+            "try{B.onChunk(K,i>=0?s.slice(i+1):s);}catch(e){return;}" +
+            "off+=STEP;setTimeout(next,0);};" +
+            "fr.onerror=function(){try{B.onError(K);}catch(e){}};" +
+            "fr.readAsDataURL(b.slice(off,off+STEP));" +
+            "}" +
+            "next();" +
+            "}).catch(function(){try{B.onError(K);}catch(e){}});" +
+            "})()"
+        wv.evaluateJavascript(js, null)
+    }
+
+    /**
+     * blob 下载 JS 桥:onMeta 补报类型(监听器没给 mime 时用页面 blob 的类型),
+     * onChunk 收 base64 分片追加进临时文件,onEnd/onError 收尾。
+     * 回调都在 WebView 的 JavaBridge 线程,临时文件操作在此进行,UI 反馈回主线程。
+     */
+    private inner class BlobBridge {
+        @JavascriptInterface
+        fun onMeta(key: String, mime: String) {
+            blobTasks[key]?.let { if (it.mime.isBlank() && mime.isNotBlank()) it.mime = mime }
+        }
+
+        @JavascriptInterface
+        fun onChunk(key: String, base64: String) {
+            val task = blobTasks[key] ?: return
+            try {
+                task.stream.write(Base64.decode(base64, Base64.NO_WRAP))
+            } catch (_: Exception) {
+                blobTasks.remove(key)?.let { failed ->
+                    runCatching { failed.stream.close() }
+                    runCatching { failed.file.delete() }
+                    runOnUiThread { toast(R.string.browser_dl_failed) }
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onEnd(key: String, @Suppress("UNUSED_PARAMETER") size: Double) {
+            val task = blobTasks.remove(key) ?: return
+            runCatching { task.stream.close() }
+            if (task.file.length() == 0L) {
+                runCatching { task.file.delete() }
+                runOnUiThread { toast(R.string.browser_dl_failed) }
+                return
+            }
+            saveDownloadFromTemp(task)
+        }
+
+        @JavascriptInterface
+        fun onError(key: String) {
+            blobTasks.remove(key)?.let { task ->
+                runCatching { task.stream.close() }
+                runCatching { task.file.delete() }
+                runOnUiThread { toast(R.string.browser_dl_failed) }
+            }
+        }
+    }
+
+    /** blob 内容收完:临时文件落为用户可见的下载文件并记录,回主线程提示 */
+    private fun saveDownloadFromTemp(task: BlobTask) {
+        val mime = task.mime.ifBlank { "application/octet-stream" }
+        val result = runCatching {
+            val saved = persistDownloadFile(task.file, task.name, mime)
+            addSavedFile(saved)
+            saved
+        }
+        runCatching { task.file.delete() }
+        runOnUiThread {
+            if (result.isSuccess) toast(R.string.browser_dl_saved) else toast(R.string.browser_dl_failed)
+        }
+    }
+
+    /**
+     * data: 下载(前端导出的 CSV/图片等):头部分出类型,负载按 base64/URL 编码解码,
+     * 确认后在后台线程走与 blob 相同的落盘路径。
+     */
+    private fun saveDataUriDownload(dataUrl: String, mimeType: String?) {
+        val header = dataUrl.substringBefore(',').removePrefix("data:")
+        val payload = dataUrl.substringAfter(',', "")
+        if (payload.isEmpty()) {
+            toast(R.string.browser_dl_failed)
+            return
+        }
+        val bytes = runCatching {
+            if (header.contains(";base64", ignoreCase = true)) {
+                Base64.decode(payload, Base64.DEFAULT)
+            } else {
+                // data: 的非 base64 负载按 percent-encoding 解,+ 是字面量而非空格
+                URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8")
+                    .toByteArray(Charsets.UTF_8)
+            }
+        }.getOrNull() ?: run {
+            toast(R.string.browser_dl_failed)
+            return
+        }
+        val mime = header.substringBefore(';').trim().ifBlank { mimeType.orEmpty() }
+            .ifBlank { "application/octet-stream" }
+        val name = guessDownloadName(dataUrl, null, mime)
+        val sizeText = formatBytes(bytes.size.toLong())
+        val message = if (sizeText.isEmpty()) {
+            getString(R.string.browser_dl_confirm, name)
+        } else {
+            getString(R.string.browser_dl_confirm_size, name, sizeText)
+        }
+        try {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.browser_download_title)
+                .setMessage(message)
+                .setPositiveButton(R.string.browser_dl_start) { _, _ ->
+                    Thread {
+                        val temp = File(cacheDir, "ldm_data_${System.currentTimeMillis()}")
+                        val result = runCatching {
+                            temp.writeBytes(bytes)
+                            val saved = persistDownloadFile(temp, name, mime)
+                            addSavedFile(saved)
+                            saved
+                        }
+                        runCatching { temp.delete() }
+                        runOnUiThread {
+                            if (result.isSuccess) {
+                                toast(R.string.browser_dl_saved)
+                            } else {
+                                toast(R.string.browser_dl_failed)
+                            }
+                        }
+                    }.start()
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 把已生成的临时文件落为用户可见的下载文件,走与自研引擎相同的提交逻辑
+     * (见 LdmDownloader.kt 的 commitDownloadFile):设置了自定义下载目录写该目录
+     * (SAF);否则 Android 10+ 写 MediaStore「下载」集合,更早版本写应用专属
+     * 下载目录(打开走 FileProvider)。失败抛异常,调用方负责提示。
+     */
+    private fun persistDownloadFile(src: File, name: String, mime: String): SavedFile {
+        val now = System.currentTimeMillis()
+        val treeUri = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(LdmDownloader.PREF_DL_DIR, null)?.takeIf { it.isNotBlank() }
+        val result = commitDownloadFile(this, src, name, mime, treeUri)
+        return SavedFile(now, result.uri, result.path.takeIf { result.uri.isEmpty() }, result.name, mime, result.size, now)
+    }
+
+    private fun loadSavedFiles(): MutableList<SavedFile> {
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_DOWNLOADS, null) ?: return mutableListOf()
+        val list = mutableListOf<SavedFile>()
+        runCatching {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                list.add(
+                    SavedFile(
+                        id = o.optLong("id"),
+                        uri = o.optString("uri"),
+                        path = o.optString("path").takeIf { it.isNotEmpty() },
+                        name = o.optString("n"),
+                        mime = o.optString("m"),
+                        size = o.optLong("s"),
+                        time = o.optLong("ts")
+                    )
+                )
+            }
+        }
+        return list
+    }
+
+    private fun saveSavedFiles(records: List<SavedFile>) {
+        val arr = JSONArray()
+        records.forEach { f ->
+            arr.put(
+                JSONObject()
+                    .put("id", f.id)
+                    .put("uri", f.uri)
+                    .put("path", f.path.orEmpty())
+                    .put("n", f.name)
+                    .put("m", f.mime)
+                    .put("s", f.size)
+                    .put("ts", f.time)
+            )
+        }
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREF_DOWNLOADS, arr.toString())
+            .apply()
+    }
+
+    /** 追加一条落盘记录,超出上限丢最旧的 */
+    private fun addSavedFile(record: SavedFile) {
+        val records = loadSavedFiles()
+        records.add(record)
+        while (records.size > MAX_DOWNLOAD_RECORDS) records.removeAt(0)
+        saveSavedFiles(records)
+    }
+
+    /** 合并引擎任务、系统下载(DownloadManager)与 blob/data 落盘记录,时间倒序供页面渲染 */
+    private fun collectDownloadItems(): List<DownloadItem> {
+        val items = mutableListOf<DownloadItem>()
+        // 自研引擎任务(内置下载器)
+        downloader.snapshot().forEach { s ->
+            items.add(
+                DownloadItem(
+                    id = "ldm-${s.id}",
+                    name = s.name,
+                    kind = s.kind,
+                    status = s.status,
+                    time = s.time,
+                    sourceUrl = s.url.takeIf { it.startsWith("http") },
+                    path = s.path,
+                    pct = s.pct
+                )
+            )
+        }
+        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+        if (dm != null) {
+            runCatching {
+                dm.query(DownloadManager.Query()).use { c ->
+                    val iId = c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)
+                    val iTitle = c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)
+                    val iStatus = c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)
+                    val iDone = c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                    val iTotal = c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                    // 最后修改时间列是 @hide(DownloadManager.COLUMN_LAST_MODIFICATION_TIMESTAMP),
+                    // 直接用 downloads provider 底层列名;极旧版本取不到时以当前时间兜底
+                    val iTime = runCatching { c.getColumnIndexOrThrow("lastmod") }.getOrDefault(-1)
+                    val iUri = c.getColumnIndexOrThrow(DownloadManager.COLUMN_URI)
+                    while (c.moveToNext()) {
+                        val id = c.getLong(iId)
+                        val status = c.getInt(iStatus)
+                        val sofar = c.getLong(iDone).coerceAtLeast(0)
+                        val total = c.getLong(iTotal)
+                        val time = if (iTime >= 0) c.getLong(iTime) else System.currentTimeMillis()
+                        val kind = when (status) {
+                            DownloadManager.STATUS_RUNNING -> "running"
+                            DownloadManager.STATUS_PENDING -> "waiting"
+                            DownloadManager.STATUS_PAUSED -> "paused"
+                            DownloadManager.STATUS_SUCCESSFUL -> "done"
+                            else -> "failed"
+                        }
+                        val statusText = when (kind) {
+                            "running" -> {
+                                val running = getString(R.string.browser_dl_status_running)
+                                when {
+                                    total > 0 -> running + "·" + (sofar * 100 / total) +
+                                        "%(" + formatBytes(sofar) + "/" + formatBytes(total) + ")"
+                                    sofar > 0 -> running + "·" + formatBytes(sofar)
+                                    else -> running
+                                }
+                            }
+                            "waiting" -> getString(R.string.browser_dl_status_waiting)
+                            "paused" -> getString(R.string.browser_dl_status_paused)
+                            "done" -> getString(R.string.browser_dl_status_done)
+                            else -> getString(R.string.browser_dl_status_failed)
+                        }
+                        items.add(
+                            DownloadItem(
+                                id = "dm-$id",
+                                name = c.getString(iTitle)?.takeIf { it.isNotBlank() } ?: "download",
+                                kind = kind,
+                                status = if (kind == "done" && total > 0) {
+                                    statusText + "·" + formatBytes(total)
+                                } else {
+                                    statusText
+                                },
+                                time = time,
+                                sourceUrl = c.getString(iUri),
+                                pct = if (kind == "running" && total > 0) {
+                                    ((sofar * 100) / total).toInt().coerceIn(0, 100)
+                                } else {
+                                    -1
+                                }
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        loadSavedFiles().forEach { f ->
+            val sizeText = formatBytes(f.size)
+            items.add(
+                DownloadItem(
+                    id = "nat-${f.id}",
+                    name = f.name,
+                    kind = "saved",
+                    status = getString(R.string.browser_dl_status_saved) +
+                        if (sizeText.isEmpty()) "" else "·$sizeText",
+                    time = f.time,
+                    sourceUrl = null
+                )
+            )
+        }
+        return items.sortedByDescending { it.time }
+    }
+
+    /**
+     * 点条目:已完成的唤起「打开方式」选择器;引擎的已暂停/失败任务点按=继续下载
+     * (主流浏览器语义),进行中提示状态。
+     */
+    private fun openDownloadItem(id: String) {
+        if (id.startsWith("ldm-")) {
+            val taskId = id.removePrefix("ldm-").toLongOrNull() ?: return
+            val snap = downloader.snapshot().firstOrNull { it.id == taskId } ?: return
+            when (snap.kind) {
+                "done" -> {
+                    val target = when {
+                        // MediaStore/SAF 落盘:内容地址直接打开
+                        !snap.uri.isNullOrBlank() -> Uri.parse(snap.uri)
+                        // ≤28 应用专属目录:FileProvider 授权后交外部应用打开
+                        !snap.path.isNullOrBlank() && File(snap.path).exists() -> runCatching {
+                            FileProvider.getUriForFile(this, "$packageName.fileprovider", File(snap.path))
+                        }.getOrNull()
+                        else -> null
+                    } ?: run {
+                        toast(R.string.browser_dl_open_fail)
+                        return
+                    }
+                    openWithViewer(target, snap.mime.orEmpty())
+                }
+                "paused", "failed" -> {
+                    downloader.resume(taskId)
+                    toast(R.string.browser_dl_resumed)
+                }
+                else -> toast(R.string.browser_dl_in_progress)
+            }
+            return
+        }
+        if (id.startsWith("dm-")) {
+            val dmId = id.removePrefix("dm-").toLongOrNull() ?: return
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
+            runCatching {
+                dm.query(DownloadManager.Query().setFilterById(dmId)).use { c ->
+                    if (!c.moveToFirst()) return
+                    when (c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))) {
+                        DownloadManager.STATUS_SUCCESSFUL -> {
+                            val uri = dm.getUriForDownloadedFile(dmId) ?: run {
+                                toast(R.string.browser_dl_open_fail)
+                                return
+                            }
+                            openWithViewer(uri, dm.getMimeTypeForDownloadedFile(dmId).orEmpty())
+                        }
+                        DownloadManager.STATUS_FAILED -> toast(R.string.browser_dl_status_failed)
+                        else -> toast(R.string.browser_dl_in_progress)
+                    }
+                }
+            }.onFailure { toast(R.string.browser_dl_open_fail) }
+            return
+        }
+        val nid = id.removePrefix("nat-").toLongOrNull() ?: return
+        val record = loadSavedFiles().firstOrNull { it.id == nid } ?: return
+        val uri = when {
+            // ≤28 落在应用专属目录:FileProvider 授权后交外部应用打开
+            record.path != null -> runCatching {
+                FileProvider.getUriForFile(this, "$packageName.fileprovider", File(record.path))
+            }.getOrNull() ?: run {
+                toast(R.string.browser_dl_open_fail)
+                return
+            }
+            record.uri.isNotEmpty() -> Uri.parse(record.uri)
+            else -> null
+        } ?: return
+        openWithViewer(uri, record.mime)
+    }
+
+    /**
+     * 用外部应用打开内容地址:唤起系统「打开方式」选择器(不走默认应用),
+     * mime 缺省通配;FileProvider 的地址补上 ClipData 授权,选择器里任何应用都能读。
+     */
+    private fun openWithViewer(uri: Uri, mime: String) {
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime.ifBlank { "*/*" })
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val chooser = Intent.createChooser(view, getString(R.string.browser_dl_open_with))
+        if (uri.authority == "$packageName.fileprovider") {
+            chooser.clipData = ClipData.newRawUri(null, uri)
+            chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(chooser)
+        } catch (_: Exception) {
+            toast(R.string.browser_dl_open_fail)
+        }
+    }
+
+    /** 长按「删除」:引擎任务连记录带文件一起删,系统下载 dm.remove,落盘记录删文件/媒体条目 */
+    private fun deleteDownloadItem(id: String) {
+        when {
+            id.startsWith("ldm-") -> {
+                val taskId = id.removePrefix("ldm-").toLongOrNull() ?: return
+                downloader.delete(taskId)
+            }
+            id.startsWith("dm-") -> {
+                val dmId = id.removePrefix("dm-").toLongOrNull() ?: return
+                val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
+                runCatching { dm.remove(dmId) }
+            }
+            else -> {
+                val nid = id.removePrefix("nat-").toLongOrNull() ?: return
+                val record = loadSavedFiles().firstOrNull { it.id == nid } ?: return
+                saveSavedFiles(loadSavedFiles().filter { it.id != nid })
+                runCatching { deleteCommitted(this, record.uri, record.path ?: "") }
+            }
+        }
+        toast(R.string.browser_dl_deleted)
+        reloadDownloadsPage()
+    }
+
+    /** 下载管理页 JS 桥:点条目打开、长按弹原生菜单(带条目纵向位置) */
+    private inner class DownloadsBridge {
+        @JavascriptInterface
+        fun open(id: String) {
+            runOnUiThread { openDownloadItem(id) }
+        }
+
+        @JavascriptInterface
+        fun onLongPress(id: String, cssTop: Double, cssHeight: Double) {
+            runOnUiThread { showDownloadItemMenu(id, cssTop.toFloat(), cssHeight.toFloat()) }
+        }
+    }
+
+    /**
+     * 下载条目长按菜单:暂停/继续(引擎任务)/ 打开(已完成/已保存,走「打开方式」)/
+     * 复制来源链接(有链接的)/ 复制文件路径(已落盘的)/ 删除
+     */
+    private fun showDownloadItemMenu(id: String, cssTop: Float, cssHeight: Float) {
+        val item = collectDownloadItems().firstOrNull { it.id == id } ?: return
+        val view = tabs.firstOrNull { isDownloadsTab(it) }?.webView ?: return
+        val actions = mutableListOf<BrowserMenuAction>()
+        when (item.kind) {
+            "running", "waiting" -> if (id.startsWith("ldm-")) {
+                val taskId = id.removePrefix("ldm-").toLongOrNull()
+                if (taskId != null) {
+                    actions.add(
+                        BrowserMenuAction(getString(R.string.browser_dl_pause), action = {
+                            downloader.pause(taskId)
+                        })
+                    )
+                }
+            }
+            "paused", "failed" -> if (id.startsWith("ldm-")) {
+                val taskId = id.removePrefix("ldm-").toLongOrNull()
+                if (taskId != null) {
+                    actions.add(
+                        BrowserMenuAction(getString(R.string.browser_dl_resume), action = {
+                            downloader.resume(taskId)
+                            reloadDownloadsPage()
+                        })
+                    )
+                }
+            }
+            "done", "saved" -> actions.add(
+                BrowserMenuAction(getString(R.string.browser_dl_open), action = { openDownloadItem(id) })
+            )
+        }
+        item.sourceUrl?.takeIf { it.startsWith("http") }?.let { source ->
+            actions.add(
+                BrowserMenuAction(getString(R.string.browser_dl_copy_link), action = {
+                    copyToClipboard(source)
+                    toast(R.string.browser_history_copied)
+                })
+            )
+        }
+        itemPathForCopy(item)?.let { path ->
+            actions.add(
+                BrowserMenuAction(getString(R.string.browser_dl_copy_path), action = {
+                    copyToClipboard(path)
+                    toast(R.string.browser_dl_path_copied)
+                })
+            )
+        }
+        actions.add(
+            BrowserMenuAction(getString(R.string.browser_dl_delete), action = { deleteDownloadItem(id) })
+        )
+        showRowMenuInWebView(view, cssTop, cssHeight, actions)
+    }
+
+    /** 复制到系统剪贴板 */
+    private fun copyToClipboard(text: String) {
+        (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)
+            ?.setPrimaryClip(ClipData.newPlainText(null, text))
+    }
+
+    /**
+     * 条目的文件路径(供长按复制):引擎任务/应用专属目录直接给;
+     * MediaStore/SAF 内容地址尽力解析成物理路径,解析不出就没有该菜单项。
+     */
+    private fun itemPathForCopy(item: DownloadItem): String? {
+        when (item.id.substringBefore('-')) {
+            "ldm" -> return item.path
+            "nat" -> {
+                val nid = item.id.removePrefix("nat-").toLongOrNull() ?: return null
+                val record = loadSavedFiles().firstOrNull { it.id == nid } ?: return null
+                record.path?.let { return it }
+                val uri = record.uri.takeIf { it.isNotEmpty() } ?: return null
+                return resolveMediaPath(this, Uri.parse(uri))
+            }
+            "dm" -> {
+                val dmId = item.id.removePrefix("dm-").toLongOrNull() ?: return null
+                val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return null
+                val uri = runCatching { dm.getUriForDownloadedFile(dmId) }.getOrNull() ?: return null
+                return resolveMediaPath(this, uri)
+            }
+        }
+        return null
+    }
+
+    /** 下载管理页数据(JSON 数组:id/name/kind/status/time/pct/search) */
+    private fun downloadsJson(): String {
+        val arr = JSONArray()
+        collectDownloadItems().forEach { item ->
+            arr.put(
+                JSONObject()
+                    .put("id", item.id)
+                    .put("name", item.name)
+                    .put("kind", item.kind)
+                    .put("status", item.status)
+                    .put("time", formatHistoryTime(item.time))
+                    .put("pct", item.pct)
+                    .put("search", (item.name + " " + item.sourceUrl.orEmpty()).lowercase(Locale.ROOT))
+            )
+        }
+        // 内联进 <script>:转义 < 防止 </script> 提前闭合
+        return arr.toString().replace("<", "\\u003c")
+    }
+
+    /** 进度实时刷新:ContentObserver 去抖后把最新数据推给当前开着的下载管理页 */
+    private fun pushDownloadsData() {
+        val tab = tabs.getOrNull(currentIndex) ?: return
+        if (!isDownloadsTab(tab)) return
+        tab.webView.evaluateJavascript("renderData(${downloadsJson()})", null)
+    }
+
+    private fun scheduleDownloadsRefresh() {
+        mainHandler.removeCallbacks(downloadsRefreshRunnable)
+        mainHandler.postDelayed(downloadsRefreshRunnable, DOWNLOAD_REFRESH_DELAY_MS)
+    }
+
+    /** 系统下载进度观察者:Activity 存续期注册,只在下载管理页是当前页时才推送刷新 */
+    private fun registerDownloadsObserver() {
+        if (downloadsObserver != null) return
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                scheduleDownloadsRefresh()
+            }
+        }
+        downloadsObserver = observer
+        runCatching {
+            contentResolver.registerContentObserver(
+                Uri.parse("content://downloads/my_downloads"), true, observer
+            )
+        }
+    }
+
+    /**
+     * 下载管理页 HTML:行数据由页面内 renderData(JSON) 渲染 —— 初始数据内联,
+     * 之后进度变化走 evaluateJavascript 增量推 JSON,不整页重载(滚动位置/搜索词不丢)。
+     * 条目可长按(500ms,JS 检测)弹原生菜单;顶部搜索框按文件名/来源过滤。
+     */
+    private fun buildDownloadsHtml(): String {
+        val bg = colorHex(R.color.bg)
+        val fg = colorHex(R.color.on_surface)
+        val hint = colorHex(R.color.hint)
+        val div = colorHex(R.color.divider)
+        val surface = colorHex(R.color.surface)
+        val accent = colorHex(R.color.accent)
+        val empty = getString(R.string.browser_dl_empty)
+        val script = """
+            var items=[];
+            function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+            function renderData(list){
+              items=list||[];
+              var html='';
+              for(var i=0;i<items.length;i++){
+                var it=items[i];
+                html+="<a href='javascript:void(0)' data-id='"+i+"' data-search=\""+esc(it.search)+"\" "+
+                  "ontouchstart='lpStart(event,this)' ontouchmove='lpCancel()' ontouchend='lpEnd(event)' "+
+                  "onclick='return onTap(this)'>"+
+                  "<span class='col'><span class='t'>"+esc(it.name)+"</span>"+
+                  "<span class='u'>"+esc(it.status)+"</span>"+
+                  (it.pct>=0?"<span class='bar'><i style='width:"+it.pct+"%'></i></span>":"")+
+                  "</span>"+
+                  "<span class='time'>"+esc(it.time)+"</span></a>";
+              }
+              document.getElementById('list').innerHTML=html||"<div class='empty'>$empty</div>";
+              var q=document.getElementById('q');
+              onSearch(q?q.value:'');
+            }
+            function onTap(el){
+              var it=items[parseInt(el.getAttribute('data-id'),10)];
+              if(it&&window.LdmDownloads){ LdmDownloads.open(it.id); }
+              return false;
+            }
+            var lpTimer=null, lpFired=false, lpEl=null;
+            function lpStart(ev, el){
+              lpFired=false; lpEl=el;
+              lpTimer=setTimeout(function(){
+                lpFired=true;
+                if(window.LdmDownloads && lpEl){
+                  var it=items[parseInt(lpEl.getAttribute('data-id'),10)];
+                  if(it){
+                    var r=lpEl.getBoundingClientRect();
+                    LdmDownloads.onLongPress(it.id, r.top, r.height);
+                  }
+                }
+              }, 500);
+            }
+            function lpCancel(){ if(lpTimer){ clearTimeout(lpTimer); lpTimer=null; } }
+            function lpEnd(ev){ lpCancel(); if(lpFired){ ev.preventDefault(); lpFired=false; } }
+            renderData(__init);
+        """.trimIndent()
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+            "<title>${getString(R.string.browser_downloads)}</title><style>" +
+            "body{margin:0;background:$bg;color:$fg;}" +
+            "a{display:flex;align-items:center;gap:10px;padding:10px 14px;" +
+            "text-decoration:none;color:$fg;border-bottom:1px solid $div;" +
+            "-webkit-user-select:none;user-select:none;}" +
+            "a:active{background:$div;}" +
+            ".col{flex:1;min-width:0;display:flex;flex-direction:column;}" +
+            ".t{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}" +
+            ".u{font-size:12px;color:$hint;white-space:nowrap;overflow:hidden;" +
+            "text-overflow:ellipsis;margin-top:2px;}" +
+            ".bar{display:block;height:3px;margin-top:5px;background:$div;" +
+            "border-radius:2px;overflow:hidden;}" +
+            ".bar i{display:block;height:100%;background:$accent;border-radius:2px;}" +
+            ".time{flex-shrink:0;font-size:12px;color:$hint;}" +
+            ".empty{padding:48px 0;text-align:center;color:$hint;font-size:14px;}" +
+            listPageSearchCss(surface, bg, fg, hint, div) +
+            "</style><script>$listPageSearchJs</script></head><body>" +
+            listPageSearchBar(R.string.browser_dl_search_hint) +
+            "<div id='list'></div>" +
+            "<div id='noresult' class='empty' style='display:none'>" +
+            getString(R.string.browser_dl_search_empty) + "</div>" +
+            "<script>var __init=${downloadsJson()};$script</script></body></html>"
+    }
+
+    /**
+     * blob 下载文件名钩子:捕获阶段监听点击,记录被点 <a download href="blob:..."> 的
+     * download 属性 —— DownloadListener 拿不到 anchor 信息,随后从这里读文件名。
+     * window 标记防重复注入;每次导航是新 document,标记自然复位。
+     */
+    private fun injectBlobDownloadHook(view: WebView?) {
+        if (view == null) return
+        view.evaluateJavascript(
+            "(function(){if(window.__ldmBlobHook){return;}window.__ldmBlobHook=1;" +
+                "document.addEventListener('click',function(e){" +
+                "var el=e.target;while(el&&el.tagName!=='A'){el=el.parentElement;}" +
+                "if(!el){return;}var h=el.getAttribute('href')||'';" +
+                "if(h.indexOf('blob:')===0){window.__ldmBlobName=el.getAttribute('download')||'';}" +
+                "},true);})()",
+            null
+        )
+    }
+
     private fun rememberNavigableUrl(view: WebView?, url: String?) {
         if (view == null || !isWebUrl(url)) return
         val index = tabs.indexOfFirst { it.webView == view }
@@ -4130,7 +5244,25 @@ class BrowserActivity : AppCompatActivity() {
         if (saveOnExit) saveSession()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 回到界面时下载管理页可能已过期(在外面时下载完成/被删),推一次最新数据
+        if (tabs.getOrNull(currentIndex)?.let { isDownloadsTab(it) } == true) {
+            pushDownloadsData()
+        }
+    }
+
     override fun onDestroy() {
+        // 下载器收尾:摘掉下载进度观察者与引擎回调,丢弃进行中的 blob 接收任务(临时文件一并清理)
+        downloadsObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
+        downloadsObserver = null
+        mainHandler.removeCallbacks(downloadsRefreshRunnable)
+        downloader.onUpdate = null
+        blobTasks.values.forEach { task ->
+            runCatching { task.stream.close() }
+            runCatching { task.file.delete() }
+        }
+        blobTasks.clear()
         // 退出前保存:开 → 落一份最终完整状态;关 → 真正退出时清档(下次打开不恢复)
         if (saveOnExit) {
             saveSession()
@@ -4189,6 +5321,27 @@ class BrowserActivity : AppCompatActivity() {
 
         /** 收藏记录存储 key(JSONArray:u=网址 t=标题,新的在前) */
         private const val PREF_BOOKMARKS = "browser_bookmarks"
+
+        /** 下载管理页虚拟地址(about: 系,同历史记录页,不进网页历史、随会话保存) */
+        private const val DOWNLOADS_URL = "about:downloads"
+
+        /** blob/data 落盘记录存储 key(JSONArray:id/uri/path/n/m/s/ts,新的在后) */
+        private const val PREF_DOWNLOADS = "browser_downloads"
+        private const val MAX_DOWNLOAD_RECORDS = 300
+
+        /** 下载方式(设置弹窗切换,持久化):0=内置下载器(自研引擎) 1=系统下载器 */
+        internal const val PREF_DL_METHOD = "browser_dl_method"
+        internal const val DL_METHOD_BUILTIN = 0
+        internal const val DL_METHOD_SYSTEM = 1
+
+        private const val REQ_POST_NOTIFICATIONS = 4001
+        private const val REQ_PICK_DOWNLOAD_DIR = 4002
+
+        /** 下载进度实时刷新:ContentObserver 触发后的去抖间隔(ms) */
+        private const val DOWNLOAD_REFRESH_DELAY_MS = 1000L
+
+        /** blob 内容分片大小(字节):1MB,base64 后过 JS 桥的字符串长度可控 */
+        private const val DOWNLOAD_BLOB_CHUNK_BYTES = 1024 * 1024
 
         /** 标签页宽度设置(设置弹窗双点滑块,dp;两值相同 = 固定宽度) */
         private const val PREF_TAB_MIN_WIDTH = "tab_min_width"
