@@ -356,6 +356,12 @@ class BrowserActivity : AppCompatActivity() {
 
         tabLayout.addOnTabSelectedListener(tabSelectedListener)
 
+        // 标签栏宽度变化(首帧布局完成/旋转/折叠/分屏)后按新宽度重排标签:
+        // 宽屏摊满的份额依赖实际宽度;post 到布局结束后执行,避免在布局过程中改尺寸
+        tabLayout.addOnLayoutChangeListener { _, _, _, right, _, _, _, oldRight, _ ->
+            if (right != oldRight) tabLayout.post { renderBrowserTabs() }
+        }
+
         // 布局调换(设置弹窗切换):标签页放到网址栏上方
         applyLayoutOrder()
         // 标签栏隐藏状态(长按「菜单」/「全部标签页」切换):重建外壳后保持
@@ -769,6 +775,21 @@ class BrowserActivity : AppCompatActivity() {
      * - 末尾追加「+」新建标签项(跟随最后一个标签,不固定在屏幕右侧)
      */
     private fun renderBrowserTabs() {
+        // 宽屏摊满:标签少而整排有空位时,标签按份额长大,平板上不再缩在左边
+        // 空出一大截(桌面浏览器同款行为);份额不大于设置上限时行为不变。
+        // 上限用宽度滑杆的全局上限(240dp),不突破设置可调的范围。
+        // 首帧 tabLayout 还没量出宽度时按 0 处理,布局完成后有监听器触发重排。
+        val density = resources.displayMetrics.density
+        val sharePx = if (tabLayout.width > 0 && tabs.isNotEmpty()) {
+            (tabLayout.width - tabLayout.paddingEnd - PLUS_TAB_WIDTH_DP * density) / tabs.size
+        } else {
+            0f
+        }
+        val growMax = if (sharePx > tabMaxWidth * density) {
+            minOf(sharePx, TAB_WIDTH_RANGE_MAX * density)
+        } else {
+            tabMaxWidth * density
+        }
         tabs.forEachIndexed { i, item ->
             val tab = tabLayout.getTabAt(i) ?: return@forEachIndexed
             val v = tab.customView
@@ -776,7 +797,6 @@ class BrowserActivity : AppCompatActivity() {
                     .also { tab.customView = it }
             val titleView = v.findViewById<TextView>(R.id.tab_title)
             titleView.text = displayTitle(item)
-            val density = resources.displayMetrics.density
             if (i == currentIndex) {
                 // 当前标签:被截断的长标题走马灯滚动两遍(次数在布局里)
                 titleView.ellipsize = TextUtils.TruncateAt.MARQUEE
@@ -796,7 +816,7 @@ class BrowserActivity : AppCompatActivity() {
             val natural = 30 * density + titleView.paint.measureText(displayTitle(item))
             val widthPx = natural.coerceIn(
                 tabMinWidth * density,
-                tabMaxWidth * density
+                growMax
             )
             v.layoutParams = v.layoutParams.also { it.width = widthPx.toInt() }
             val action = v.findViewById<ImageButton>(R.id.tab_close)
@@ -4180,6 +4200,9 @@ class BrowserActivity : AppCompatActivity() {
         private const val PREF_TAB_MAX_WIDTH = "tab_max_width"
         private const val TAB_WIDTH_RANGE_MIN = 48
         private const val TAB_WIDTH_RANGE_MAX = 240
+
+        /** 尾部「+」标签的宽度(item_browser_tab_add):计算摊满份额时要从整排里扣掉 */
+        private const val PLUS_TAB_WIDTH_DP = 32
         private const val TAB_WIDTH_DEFAULT_MIN = 48
         private const val TAB_WIDTH_DEFAULT_MAX = 186
 
