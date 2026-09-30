@@ -2753,9 +2753,14 @@ class BrowserActivity : AppCompatActivity() {
                     if (index == currentIndex) {
                         progressBar.visibility = View.VISIBLE
                         progressBar.progress = 5
-                        // 隐藏标签栏:加载中显示网址,加载完成由 onPageFinished 换回标题
-                        if (tabBarHidden && !addressBar.hasFocus()) {
-                            addressBar.setText(url ?: tabs[index].url)
+                        // 地址栏跟随导航:页内点链接也要即时换新地址(此前只有隐藏标签栏
+                        // 模式才更新,常规模式会一直停在旧网址);编辑中不打扰
+                        if (!addressBar.hasFocus()) {
+                            if (isWebUrl(url)) {
+                                addressBar.setText(url)
+                            } else {
+                                syncAddressBrowseText(tabs[index])
+                            }
                         }
                     }
                 }
@@ -2791,6 +2796,17 @@ class BrowserActivity : AppCompatActivity() {
                     }
                 }
                 updateToolbarState()
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                // SPA(pushState)与客户端重定向不一定重走 onPageStarted:
+                // 历史点位一变化就同步标签地址与地址栏,免得停在旧网址
+                rememberNavigableUrl(view, url)
+                val index = tabs.indexOfFirst { it.webView == view }
+                if (index == currentIndex && !addressBar.hasFocus() && isWebUrl(url)) {
+                    addressBar.setText(url)
+                }
             }
 
             override fun onReceivedError(
