@@ -37,6 +37,7 @@ import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.util.TypedValue
 import android.view.ViewGroup
 import android.view.Gravity
 import android.view.ViewConfiguration
@@ -286,7 +287,11 @@ class BrowserActivity : AppCompatActivity() {
     /** 下载管理页进度观察者(系统下载变化时去抖推送刷新;onCreate 注册,onDestroy 摘除) */
     private var downloadsObserver: ContentObserver? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val downloadsRefreshRunnable = Runnable { pushDownloadsData() }
+    private var downloadsRefreshPending = false
+    private val downloadsRefreshRunnable = Runnable {
+        downloadsRefreshPending = false
+        pushDownloadsData()
+    }
 
     /** 下载方式:内置下载器(自研引擎)或系统下载器(设置弹窗切换,持久化) */
     private var downloadMethod = DL_METHOD_BUILTIN
@@ -4088,8 +4093,9 @@ class BrowserActivity : AppCompatActivity() {
      *   JS 桥(BlobBridge),原生拼成临时文件再落盘(与引擎共用 commitDownloadFile,
      *   同样存到设置的下载目录)
      * - 下载管理页(about:downloads,虚拟地址同历史/收藏页)合并展示引擎任务、系统下载与
-     *   blob/data 落盘记录:点条目已完成唤起「打开方式」,长按暂停/继续/打开/复制来源链接/
-     *   复制文件路径/删除;引擎进度与系统下载 ContentObserver 都去抖后增量刷新当前页
+     *   blob/data 落盘记录:进行中点条目=暂停、已暂停/失败点=继续、已完成唤起「打开方式」;
+     *   长按暂停/继续/打开/复制来源链接/复制文件路径/删除(删除需确认,可勾选连本地文件
+     *   一起删);引擎进度与系统下载 ContentObserver 都节流后增量刷新当前页
      */
     private class BlobTask(
         val name: String,
@@ -4232,6 +4238,10 @@ class BrowserActivity : AppCompatActivity() {
                         enqueueHttpDownload(wv, url, userAgent, name, mimeType)
                     }
                     toast(R.string.browser_dl_started)
+                }
+                .setNeutralButton(R.string.browser_dl_copy_url) { _, _ ->
+                    copyToClipboard(url)
+                    toast(R.string.browser_history_copied)
                 }
                 .setNegativeButton(R.string.cancel, null)
                 .show()
@@ -4576,6 +4586,9 @@ class BrowserActivity : AppCompatActivity() {
         val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
         if (dm != null) {
             runCatching {
+                // 「只删记录」过的系统下载不再展示(文件仍留在公共下载目录)
+                val hiddenDm = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .getStringSet(PREF_DM_HIDDEN, null).orEmpty()
                 dm.query(DownloadManager.Query()).use { c ->
                     val iId = c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID)
                     val iTitle = c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)
@@ -4588,6 +4601,7 @@ class BrowserActivity : AppCompatActivity() {
                     val iUri = c.getColumnIndexOrThrow(DownloadManager.COLUMN_URI)
                     while (c.moveToNext()) {
                         val id = c.getLong(iId)
+                        if (id.toString() in hiddenDm) continue
                         val status = c.getInt(iStatus)
                         val sofar = c.getLong(iDone).coerceAtLeast(0)
                         val total = c.getLong(iTotal)
@@ -4611,7 +4625,12 @@ class BrowserActivity : AppCompatActivity() {
                             }
                             "waiting" -> getString(R.string.browser_dl_status_waiting)
                             "paused" -> getString(R.string.browser_dl_status_paused)
-                            "done" -> getString(R.string.browser_dl_status_done)
+                            // 完成态给满进度,样式与引擎任务一致(无进度条)
+                            "done" -> {
+                                val base = getString(R.string.browser_dl_status_done)
+                                val size = formatBytes(if (total > 0) total else sofar)
+                                if (size.isEmpty()) "$base·100%" else "$base·100%·$size"
+                            }
                             else -> getString(R.string.browser_dl_status_failed)
                         }
                         items.add(
@@ -4619,11 +4638,7 @@ class BrowserActivity : AppCompatActivity() {
                                 id = "dm-$id",
                                 name = c.getString(iTitle)?.takeIf { it.isNotBlank() } ?: "download",
                                 kind = kind,
-                                status = if (kind == "done" && total > 0) {
-                                    statusText + "·" + formatBytes(total)
-                                } else {
-                                    statusText
-                                },
+                                status = statusText,
                                 time = time,
                                 sourceUrl = c.getString(iUri),
                                 pct = if (kind == "running" && total > 0) {
@@ -4655,8 +4670,8 @@ class BrowserActivity : AppCompatActivity() {
     }
 
     /**
-     * 点条目:已完成的唤起「打开方式」选择器;引擎的已暂停/失败任务点按=继续下载
-     * (主流浏览器语义),进行中提示状态。
+     * 点条目:已完成的唤起「打开方式」选择器;引擎的进行中任务点按=暂停、
+     * 已暂停/失败点按=继续下载(主流浏览器语义),系统下载进行中提示状态。
      */
     private fun openDownloadItem(id: String) {
         if (id.startsWith("ldm-")) {
@@ -4678,11 +4693,14 @@ class BrowserActivity : AppCompatActivity() {
                     }
                     openWithViewer(target, snap.mime.orEmpty())
                 }
+                "running", "waiting" -> {
+                    downloader.pause(taskId)
+                    toast(R.string.browser_dl_paused)
+                }
                 "paused", "failed" -> {
                     downloader.resume(taskId)
                     toast(R.string.browser_dl_resumed)
                 }
-                else -> toast(R.string.browser_dl_in_progress)
             }
             return
         }
@@ -4744,27 +4762,113 @@ class BrowserActivity : AppCompatActivity() {
         }
     }
 
-    /** 长按「删除」:引擎任务连记录带文件一起删,系统下载 dm.remove,落盘记录删文件/媒体条目 */
-    private fun deleteDownloadItem(id: String) {
+    /**
+     * 长按「删除」:先弹确认框,可勾选同时删除本地文件(默认只删记录)。
+     * 内容区自绘(文件名 + 勾选行),不依赖系统列表:appcompat 弹窗
+     * setMessage 与 setMultiChoiceItems 同用时勾选行不渲染。
+     */
+    private fun confirmDeleteDownload(item: DownloadItem) {
+        val density = resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val box = CheckBox(this)
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            val a = obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
+            background = a.getDrawable(0)
+            a.recycle()
+            setOnClickListener { box.toggle() }   // 整行可点,不必精确点中框
+            addView(box)
+            addView(
+                TextView(this@BrowserActivity).apply {
+                    setText(R.string.browser_dl_delete_file_too)
+                    setTextAppearance(android.R.style.TextAppearance_Material_Medium)
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(8) }
+            )
+        }
+        // 内边距取主题的 dialogPreferredPadding:与弹窗标题/正文对齐,不猜各 ROM 的数值
+        val pad = TypedValue().let { tv ->
+            if (theme.resolveAttribute(androidx.appcompat.R.attr.dialogPreferredPadding, tv, true) &&
+                tv.type == TypedValue.TYPE_DIMENSION
+            ) {
+                TypedValue.complexToDimension(tv.data, resources.displayMetrics).toInt()
+            } else {
+                dp(20)
+            }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(4), pad, dp(4))
+            addView(
+                TextView(this@BrowserActivity).apply {
+                    text = item.name
+                    setTextAppearance(android.R.style.TextAppearance_Material_Medium)
+                }
+            )
+            addView(
+                row, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(12) }
+            )
+        }
+        try {
+            val dialog = AlertDialog.Builder(this)
+                .setTitle(R.string.browser_dl_delete_title)
+                .setView(content)
+                .setPositiveButton(R.string.browser_dl_delete) { _, _ ->
+                    deleteDownloadItem(item.id, box.isChecked)
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
+            // 部分主题会给自定义内容区再包一层内边距,清掉,间距以自绘区为准
+            (dialog.findViewById(androidx.appcompat.R.id.custom) as? ViewGroup)?.setPadding(0, 0, 0, 0)
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 删除下载条目:记录总是删;本地文件按 [deleteFile] 决定去留。
+     * 引擎任务连 .part 中转文件一起清;系统下载勾选时 dm.remove(记录与文件一起删),
+     * 不勾选时只把条目从列表隐藏(DownloadManager.remove 连文件一起删,只能记隐藏名单);
+     * 落盘记录删除 MediaStore 条目/SAF 文档/应用目录文件。
+     */
+    private fun deleteDownloadItem(id: String, deleteFile: Boolean) {
         when {
             id.startsWith("ldm-") -> {
                 val taskId = id.removePrefix("ldm-").toLongOrNull() ?: return
-                downloader.delete(taskId)
+                downloader.delete(taskId, deleteFile)
             }
             id.startsWith("dm-") -> {
                 val dmId = id.removePrefix("dm-").toLongOrNull() ?: return
                 val dm = getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager ?: return
-                runCatching { dm.remove(dmId) }
+                if (deleteFile) {
+                    runCatching { dm.remove(dmId) }
+                } else {
+                    hideDownloadManagerRow(dmId)
+                }
             }
             else -> {
                 val nid = id.removePrefix("nat-").toLongOrNull() ?: return
                 val record = loadSavedFiles().firstOrNull { it.id == nid } ?: return
                 saveSavedFiles(loadSavedFiles().filter { it.id != nid })
-                runCatching { deleteCommitted(this, record.uri, record.path ?: "") }
+                if (deleteFile) runCatching { deleteCommitted(this, record.uri, record.path ?: "") }
             }
         }
         toast(R.string.browser_dl_deleted)
         reloadDownloadsPage()
+    }
+
+    /** 把系统下载条目从下载管理页隐藏但保留文件:名单存主配置 */
+    private fun hideDownloadManagerRow(dmId: Long) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val hidden = prefs.getStringSet(PREF_DM_HIDDEN, null)?.toMutableSet() ?: mutableSetOf()
+        hidden.add(dmId.toString())
+        prefs.edit().putStringSet(PREF_DM_HIDDEN, hidden).apply()
     }
 
     /** 下载管理页 JS 桥:点条目打开、长按弹原生菜单(带条目纵向位置) */
@@ -4831,7 +4935,7 @@ class BrowserActivity : AppCompatActivity() {
             )
         }
         actions.add(
-            BrowserMenuAction(getString(R.string.browser_dl_delete), action = { deleteDownloadItem(id) })
+            BrowserMenuAction(getString(R.string.browser_dl_delete), action = { confirmDeleteDownload(item) })
         )
         showRowMenuInWebView(view, cssTop, cssHeight, actions)
     }
@@ -4892,8 +4996,14 @@ class BrowserActivity : AppCompatActivity() {
         tab.webView.evaluateJavascript("renderData(${downloadsJson()})", null)
     }
 
+    /**
+     * 节流式刷新:第一次回调后最多 1 秒推一次,推送期间后续回调合并掉 ——
+     * 不能用 removeCallbacks+postDelayed 去抖:引擎每 400ms 回调一次,
+     * 每次都把待执行的推送往后推,下载期间永远等不到触发。
+     */
     private fun scheduleDownloadsRefresh() {
-        mainHandler.removeCallbacks(downloadsRefreshRunnable)
+        if (downloadsRefreshPending) return
+        downloadsRefreshPending = true
         mainHandler.postDelayed(downloadsRefreshRunnable, DOWNLOAD_REFRESH_DELAY_MS)
     }
 
@@ -5327,6 +5437,9 @@ class BrowserActivity : AppCompatActivity() {
 
         /** blob/data 落盘记录存储 key(JSONArray:id/uri/path/n/m/s/ts,新的在后) */
         private const val PREF_DOWNLOADS = "browser_downloads"
+
+        /** 只删记录保留文件的系统下载 id 名单(DownloadManager.remove 连文件一起删) */
+        private const val PREF_DM_HIDDEN = "browser_dm_hidden"
         private const val MAX_DOWNLOAD_RECORDS = 300
 
         /** 下载方式(设置弹窗切换,持久化):0=内置下载器(自研引擎) 1=系统下载器 */

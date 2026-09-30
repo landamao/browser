@@ -137,6 +137,7 @@ internal class LdmDownloader private constructor(private val context: Context) {
         var finalName: String,    // 完成后:去重后的最终文件名
         @Volatile var pauseRequested: Boolean,
         var pendingDelete: Boolean,
+        var pendingDeleteKeepFile: Boolean, // 删除时是否保留已落盘文件(仅记记录)
         var active: Boolean       // worker 线程是否在跑
     )
 
@@ -204,6 +205,7 @@ internal class LdmDownloader private constructor(private val context: Context) {
                     finalName = "",
                     pauseRequested = false,
                     pendingDelete = false,
+                    pendingDeleteKeepFile = false,
                     active = false
                 )
             )
@@ -246,19 +248,21 @@ internal class LdmDownloader private constructor(private val context: Context) {
     }
 
     /**
-     * 删除:去掉任务记录并删文件(.part 与已落盘文件)。
+     * 删除:去掉任务记录,.part 临时文件一并清掉;已落盘文件按 [deleteFile]
+     * 决定去留(在传任务还没有落盘文件,勾选与否只影响完成后才会有的文件)。
      * 在传的置删除标记,worker 收尾时清理;已完成的直接清理。
      */
-    fun delete(id: Long) {
+    fun delete(id: Long, deleteFile: Boolean = true) {
         var removed: Task?
         synchronized(lock) {
             removed = tasks.firstOrNull { it.id == id } ?: return
             tasks.remove(removed)
             if (removed!!.active) {
                 removed!!.pendingDelete = true
+                removed!!.pendingDeleteKeepFile = !deleteFile
                 removed!!.pauseRequested = true
             } else {
-                removed!!.deleteFiles()
+                removed!!.deleteFiles(keepCommitted = !deleteFile)
                 cancelNotif(removed!!)
             }
             persistLocked()
@@ -275,7 +279,12 @@ internal class LdmDownloader private constructor(private val context: Context) {
                 name = if (done && t.finalName.isNotBlank()) t.finalName else t.name,
                 kind = kindOf(t.status),
                 status = statusText(t),
-                pct = if (t.total > 0) ((t.done * 100) / t.total).toInt().coerceIn(0, 100) else -1,
+                // 进度条只在还有进展可看时画;完成后由状态文案给出「100%」
+                pct = if (t.status != ST_DONE && t.total > 0) {
+                    ((t.done * 100) / t.total).toInt().coerceIn(0, 100)
+                } else {
+                    -1
+                },
                 time = t.createdAt,
                 url = t.originalUrl,
                 path = if (done) t.finalPath.takeIf { it.isNotBlank() } else null,
@@ -310,7 +319,10 @@ internal class LdmDownloader private constructor(private val context: Context) {
                 if (t.status == ST_RUNNING && t.speed > 0) parts.add(formatBytes(t.speed) + "/s")
                 parts.joinToString("·")
             }
-            ST_DONE -> formatBytes(if (t.total > 0) t.total else t.done)
+            ST_DONE -> {
+                val size = formatBytes(if (t.total > 0) t.total else t.done)
+                if (size.isEmpty()) "100%" else "100%·$size"
+            }
             else -> ""
         }
         val base = context.getString(
@@ -399,7 +411,7 @@ internal class LdmDownloader private constructor(private val context: Context) {
             stop = task.pauseRequested || task.pendingDelete
             if (stop) {
                 if (task.pendingDelete) {
-                    task.deleteFiles()
+                    task.deleteFiles(keepCommitted = task.pendingDeleteKeepFile)
                     cancelNotif(task)
                 } else {
                     task.pauseRequested = false
@@ -678,6 +690,7 @@ internal class LdmDownloader private constructor(private val context: Context) {
                         finalName = o.optString("fn"),
                         pauseRequested = false,
                         pendingDelete = false,
+                        pendingDeleteKeepFile = false,
                         active = false
                     )
                 )
@@ -701,8 +714,10 @@ internal class LdmDownloader private constructor(private val context: Context) {
 
     private fun partFile(task: Task): File = File(stagingDir(), "${task.id}.part")
 
-    private fun Task.deleteFiles() {
+    /** 删任务的文件:.part 总是删(只是临时中转),已落盘文件按 [keepCommitted] 保留 */
+    private fun Task.deleteFiles(keepCommitted: Boolean = false) {
         runCatching { partFile(this@deleteFiles).delete() }
+        if (keepCommitted) return
         if (finalUri.isNotEmpty() || finalPath.isNotEmpty()) {
             runCatching { deleteCommitted(context, finalUri, finalPath) }
         }
