@@ -5585,9 +5585,12 @@ class BrowserActivity : AppCompatActivity() {
                     val iStatus = c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)
                     val iDone = c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
                     val iTotal = c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-                    // 最后修改时间列是 @hide(DownloadManager.COLUMN_LAST_MODIFICATION_TIMESTAMP),
-                    // 直接用 downloads provider 底层列名;极旧版本取不到时以当前时间兜底
-                    val iTime = runCatching { c.getColumnIndexOrThrow("lastmod") }.getOrDefault(-1)
+                    // 最后修改时间列在 query() 返回的游标里统一别名为 last_modified_timestamp
+                    // (Android 8 起各版本均如此;原始列名 lastmod 从不出现在游标里,按它查列
+                    // 永远落空)。取不到时按 0 兜底沉底,不能取当前时间——那会让所有系统
+                    // 下载条目每次刷新都被盖上最新时间,还一起顶到列表最上面
+                    val iTime = runCatching { c.getColumnIndexOrThrow("last_modified_timestamp") }
+                        .getOrDefault(-1)
                     val iUri = c.getColumnIndexOrThrow(DownloadManager.COLUMN_URI)
                     while (c.moveToNext()) {
                         val id = c.getLong(iId)
@@ -5595,7 +5598,7 @@ class BrowserActivity : AppCompatActivity() {
                         val status = c.getInt(iStatus)
                         val sofar = c.getLong(iDone).coerceAtLeast(0)
                         val total = c.getLong(iTotal)
-                        val time = if (iTime >= 0) c.getLong(iTime) else System.currentTimeMillis()
+                        val time = if (iTime >= 0) c.getLong(iTime) else 0L
                         val kind = when (status) {
                             DownloadManager.STATUS_RUNNING -> "running"
                             DownloadManager.STATUS_PENDING -> "waiting"
@@ -5681,7 +5684,7 @@ class BrowserActivity : AppCompatActivity() {
                         toast(R.string.browser_dl_open_fail)
                         return
                     }
-                    openWithViewer(target, snap.mime.orEmpty())
+                    openWithViewer(target, snap.mime.orEmpty(), snap.name)
                 }
                 "running", "waiting" -> {
                     downloader.pause(taskId)
@@ -5706,7 +5709,8 @@ class BrowserActivity : AppCompatActivity() {
                                 toast(R.string.browser_dl_open_fail)
                                 return
                             }
-                            openWithViewer(uri, dm.getMimeTypeForDownloadedFile(dmId).orEmpty())
+                            val name = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE))
+                            openWithViewer(uri, dm.getMimeTypeForDownloadedFile(dmId).orEmpty(), name)
                         }
                         DownloadManager.STATUS_FAILED -> toast(R.string.browser_dl_status_failed)
                         else -> toast(R.string.browser_dl_in_progress)
@@ -5728,16 +5732,24 @@ class BrowserActivity : AppCompatActivity() {
             record.uri.isNotEmpty() -> Uri.parse(record.uri)
             else -> null
         } ?: return
-        openWithViewer(uri, record.mime)
+        openWithViewer(uri, record.mime, record.name)
     }
 
     /**
      * 用外部应用打开内容地址:唤起系统「打开方式」选择器(不走默认应用),
      * mime 缺省通配;FileProvider 的地址补上 ClipData 授权,选择器里任何应用都能读。
+     * .apk 文件按扩展名把类型归一成标准 APK mime:存成 octet-stream 等类型时
+     * 系统安装器不会出现在选择器里,表现为点开没反应。
      */
-    private fun openWithViewer(uri: Uri, mime: String) {
+    private fun openWithViewer(uri: Uri, mime: String, name: String? = null) {
+        var type = mime.ifBlank { "*/*" }
+        if (name != null && name.endsWith(".apk", ignoreCase = true) &&
+            !type.equals("application/vnd.android.package-archive", ignoreCase = true)
+        ) {
+            type = "application/vnd.android.package-archive"
+        }
         val view = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime.ifBlank { "*/*" })
+            setDataAndType(uri, type)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         val chooser = Intent.createChooser(view, getString(R.string.browser_dl_open_with))

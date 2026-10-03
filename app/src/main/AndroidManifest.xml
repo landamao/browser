@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 内置下载器的进度/完成通知(Android 13+ 需运行时请求,不授予也有页内进度) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 点击 APK 唤起系统安装器:Android 8+ 要求调用方声明此权限,
+         否则安装器直接静默退出,表现为「点了没反应」 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".LdmBrowserApp"
