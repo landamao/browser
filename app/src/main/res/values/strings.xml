@@ -127,6 +127,7 @@
     <string name="browser_clear_scope_cookies">Cookie 与登录状态</string>
     <string name="browser_clear_scope_storage">本地存储(localStorage、IndexedDB)</string>
     <string name="browser_clear_scope_history">浏览历史与表单记录</string>
+    <string name="browser_clear_scope_passwords">保存的网站密码</string>
     <string name="browser_clear_scope_none">请至少勾选一项</string>
     <string name="browser_clear_continue">继续</string>
     <string name="browser_clear_site_only">仅当前网站</string>
@@ -168,6 +169,45 @@
     <string name="browser_history_deleted">已删除所选记录</string>
     <string name="browser_history_search_hint">搜索历史记录</string>
     <string name="browser_history_search_empty">无匹配结果</string>
+
+    <!-- 密码管理:登录时询问保存、自动填充(多条密码点选)、按站点分组列表页、导出导入 -->
+    <string name="browser_passwords">密码管理</string>
+    <string name="browser_passwords_empty">暂无保存的密码</string>
+    <string name="browser_passwords_search_hint">搜索密码</string>
+    <string name="browser_passwords_account_count">%d 个账号</string>
+    <string name="browser_passwords_account_fallback">账号 %d</string>
+    <string name="browser_passwords_export">导出密码</string>
+    <string name="browser_passwords_import">导入密码</string>
+    <string name="browser_passwords_ask_save">登录时询问保存密码</string>
+    <string name="browser_passwords_never_save">一律不保存</string>
+    <string name="browser_passwords_never_site">该网站以后不再询问保存密码</string>
+    <string name="browser_passwords_never_list">一律不保存的网站(点 ✕ 恢复询问)</string>
+    <string name="browser_passwords_never_removed">已恢复询问保存密码</string>
+    <string name="browser_passwords_no_username">无用户名</string>
+    <string name="browser_passwords_field_site">网站</string>
+    <string name="browser_passwords_field_account">账号</string>
+    <string name="browser_passwords_field_password">密码</string>
+    <string name="browser_passwords_save_title">保存密码?</string>
+    <string name="browser_passwords_update_title">更新密码?</string>
+    <string name="browser_passwords_update_note">该账号已保存过其他密码,是否更新?</string>
+    <string name="browser_passwords_save_btn">保存</string>
+    <string name="browser_passwords_update_btn">更新</string>
+    <string name="browser_passwords_not_save">不保存</string>
+    <string name="browser_passwords_saved">已保存密码</string>
+    <string name="browser_passwords_updated">已更新密码</string>
+    <string name="browser_passwords_deleted">已删除密码</string>
+    <string name="browser_passwords_delete_confirm">删除该网站保存的这条密码?</string>
+    <string name="browser_passwords_delete_site">删除该网站全部密码</string>
+    <string name="browser_passwords_delete_site_confirm">删除网站 %1$s 保存的全部密码?</string>
+    <string name="browser_passwords_copy_account">复制账号</string>
+    <string name="browser_passwords_copy_password">复制密码</string>
+    <string name="browser_passwords_export_warn">导出的文件是明文 JSON,包含全部已保存密码,请妥善保管,不要传给不信任的渠道。继续导出?</string>
+    <string name="browser_passwords_export_empty">没有可导出的密码</string>
+    <string name="browser_passwords_exported">已导出密码</string>
+    <string name="browser_passwords_export_fail">导出失败</string>
+    <string name="browser_passwords_import_fail">导入失败:文件无法读取或格式不对</string>
+    <string name="browser_passwords_import_empty">文件里没有可导入的密码</string>
+    <string name="browser_passwords_import_done">已导入 %1$d 条,更新 %2$d 条</string>
 
     <!-- 收藏:地址栏星星与列表页 -->
     <string name="browser_bookmark">收藏</string>

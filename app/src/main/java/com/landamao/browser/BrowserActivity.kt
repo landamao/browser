@@ -19,6 +19,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -67,6 +68,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ListPopupWindow
@@ -80,6 +82,9 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.appcompat.widget.AppCompatSpinner
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -111,7 +116,7 @@ import kotlin.math.roundToInt
  *   藏起时地址栏浏览态显示页面标题,编辑态才换回网址(导航途中仍先显示网址)
  * - 重命名:标题固定不再跟随网页;再次重命名清空内容确定即恢复跟随
  * - 排序:「全部标签页」列表里按住条目左缘三杠上下拖动换位,松手即保存
- * - 菜单内:主页(长按可设置自定义主页)、收藏、历史记录、退出前保存开关、设置、更多(最后一项)
+ * - 菜单内:主页(长按可设置自定义主页)、收藏、历史记录、下载管理、退出前保存开关、设置、更多(最后一项)
  * - 更多弹窗:强制刷新、在其他浏览器打开、电脑模式、关于(版本号点击复制,
  *   点 GitHub 仓库收起弹窗并在本应用新开标签页打开);点条目执行并自动关闭弹窗
  * - 历史记录:以标签页方式打开(标题+网址居左,时间居右,点条目本标签打开该站);
@@ -150,6 +155,18 @@ import kotlin.math.roundToInt
  *   同样存到设置的下载目录(Android 10+ 入 MediaStore「下载」,旧版入应用专属目录);
  *   菜单「下载管理」开列表页:点条目已完成唤起「打开方式」,长按暂停/继续/
  *   打开/复制来源链接/复制文件路径/删除,进度实时刷新
+ * - 密码管理(PasswordStore.kt 为加密存储):网页登录提交时弹「保存/更新密码」
+ *   (表单 submit、点登录按钮、输入框回车三种信号,无 form 元素的 JS 登录页也覆盖),
+ *   账号密码用 AndroidKeyStore AES-GCM 加密落盘;同站点不同账号各存一条,支持多账号。
+ *   再次访问:站点只有一条密码时自动填充(只填空字段,React 等站点用原生 setter +
+ *   input 事件兜底);输入状态(页面输入框聚焦)时在快捷输入条上方显示账号按钮
+ *   点选填入,存了一条也显示。
+ *   设置弹窗「密码管理」开列表页:按站点分组,点站点展开账号(密码默认打码,
+ *   点行显示),搜索时自动展开;账号行长按复制/打开/删除,站点行长按新开网站/
+ *   删该站全部;保存询问弹窗可对单个网站选「一律不保存」,之后该站不再询问
+ *   (密码页底部名单点按恢复);页内可勾选「登录时询问保存密码」总开关、
+ *   明文 JSON 导出(SAF 选择位置)/导入(按站点+账号合并,同账号更新密码);
+ *   「清除数据」勾选「保存的网站密码」可按范围删除
  * - 注册了 ACTION_VIEW http/https,可作为系统「打开方式」里的浏览器
  */
 class BrowserActivity : AppCompatActivity() {
@@ -172,7 +189,11 @@ class BrowserActivity : AppCompatActivity() {
         /** 自管前进后退历史(当前项由 [historyIndex] 指向),只存可恢复的 http/https/file 地址 */
         val history: MutableList<String> = mutableListOf(url),
         /** 自管历史当前项下标;新标签 = 0 */
-        var historyIndex: Int = 0
+        var historyIndex: Int = 0,
+        /** 页面探测回报有可见密码框(账号选择条显隐用;每次加载新文档先复位) */
+        var hasLoginFields: Boolean = false,
+        /** 页面探测回报正聚焦在文本类输入框(输入状态;账号选择条只在此时显示) */
+        var inputFocused: Boolean = false
     )
 
     private lateinit var tabLayout: TabLayout
@@ -233,6 +254,51 @@ class BrowserActivity : AppCompatActivity() {
             toast(if (ok) R.string.browser_note_saved_to_file else R.string.browser_note_save_fail)
         }
 
+    /** 密码导出:先弹明文提醒,确认后由这里接住用户选的位置写明文 JSON */
+    private val exportPasswordsLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+            if (uri == null) return@registerForActivityResult
+            val ok = try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(PasswordStore.exportJson(this).toByteArray(Charsets.UTF_8))
+                }
+                true
+            } catch (_: Exception) {
+                false
+            }
+            toast(if (ok) R.string.browser_passwords_exported else R.string.browser_passwords_export_fail)
+        }
+
+    /** 密码导入:读用户选的 JSON,按「站点+账号」合并,完成后刷新开着的密码页 */
+    private val importPasswordsLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            val text = try {
+                contentResolver.openInputStream(uri)?.use {
+                    it.readBytes().toString(Charsets.UTF_8)
+                }
+            } catch (_: Exception) {
+                null
+            }
+            if (text.isNullOrBlank()) {
+                toast(R.string.browser_passwords_import_fail)
+                return@registerForActivityResult
+            }
+            val result = PasswordStore.importJson(this, text)
+            when {
+                result == null -> toast(R.string.browser_passwords_import_fail)
+                result[0] == 0 && result[1] == 0 -> toast(R.string.browser_passwords_import_empty)
+                else -> {
+                    android.widget.Toast.makeText(
+                        this,
+                        getString(R.string.browser_passwords_import_done, result[0], result[1]),
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                    reloadPasswordsPage()
+                }
+            }
+        }
+
     /** 电脑模式:桌面 UA + 宽布局视口 + 缩放;全局开关,切标签时同步 */
     private var desktopMode = false
     private var mobileUserAgent: String = ""
@@ -267,11 +333,24 @@ class BrowserActivity : AppCompatActivity() {
     /** 唤端确认弹窗引用:开着时忽略后续唤端请求,退出时收掉 */
     private var openAppDialog: AlertDialog? = null
 
+    /** 密码保存询问:同一时刻只弹一个;本会话内拒绝过的「站点+账号+密码」不再重复问 */
+    private var pwdPromptShowing = false
+    private val pwdDismissed = mutableSetOf<String>()
+
     /** 当前日夜状态(系统自动切换时判断是否需要换肤) */
     private var lastKnownNight = false
 
     /** 键盘上方快捷输入条:地址栏编辑态显示 */
     private lateinit var inputHelperBar: LinearLayout
+
+    /** 账号选择条:输入状态(键盘弹出 + 页面输入框聚焦)时显示在快捷输入条上方 */
+    private lateinit var pwdPickBar: HorizontalScrollView
+
+    /** 键盘当前是否弹出(可见显示框高度骤减判定;账号选择条只在输入状态显示) */
+    private var keyboardUp = false
+
+    /** API 30+:当前键盘高度(ime insets 底边,像素;0=未弹出),驱动 applyImeLayout */
+    private var imeHeightPx = 0
 
     /** 标签页宽度范围 dp(设置弹窗滑块;两值相同 = 固定宽度) */
     private var tabMinWidth = TAB_WIDTH_DEFAULT_MIN
@@ -342,10 +421,8 @@ class BrowserActivity : AppCompatActivity() {
                 tab.history.clear()
                 tab.history.addAll(saved.history)
                 tab.historyIndex = saved.historyIndex
-                // 历史记录/收藏/下载管理页内容不靠 loadUrl,恢复后要主动渲染
-                if (current == HISTORY_URL) loadHistoryPageInto(tab)
-                if (current == BOOKMARKS_URL) loadBookmarksPageInto(tab)
-                if (current == DOWNLOADS_URL) loadDownloadsPageInto(tab)
+                // 历史记录/收藏/下载管理/密码管理页内容不靠 loadUrl,恢复后要主动渲染
+                loadListPageInto(tab, current)
                 addTab(saved.customTitle ?: tab.title, current, tab)
             }
             showTab(session.index.coerceIn(0, tabs.lastIndex))
@@ -458,12 +535,64 @@ class BrowserActivity : AppCompatActivity() {
         inputHelperBar = newQuickInputContainer()
         fillQuickInputBar(inputHelperBar) { insertIntoEditText(addressBar, it) }
         val rootLayout = findViewById<LinearLayout>(R.id.browser_root)
+        // 多账号选择条:排在快捷输入条上面一行,显隐由 updatePasswordPickBar 决定
+        pwdPickBar = HorizontalScrollView(this).apply {
+            visibility = View.GONE
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(ContextCompat.getColor(this@BrowserActivity, R.color.surface))
+        }
+        val pickRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val pickPad = (4 * resources.displayMetrics.density).toInt()
+        pickRow.setPadding(pickPad, 0, pickPad, 0)
+        pwdPickBar.addView(pickRow)
+        rootLayout.addView(
+            pwdPickBar,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
         rootLayout.addView(
             inputHelperBar,
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
+
+        // 键盘开合跟踪,分两套:
+        // API 30+ 起窗口改用 adjustNothing(不随键盘缩放),键盘高度直接取 ime insets,
+        // 哪些行跟随键盘由 applyImeLayout 按行位与焦点决定(贴底标签栏永不浮起)。
+        // 旧版本维持 adjustResize 原行为:键盘弹出/收起会触发整层布局,
+        // 可见显示框高度骤减即键盘弹出。网页的 DOM 焦点在键盘收起后仍在,
+        // 账号选择条必须结合这个状态才不会在没输入时一直挂着。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+            // 非 e2e 窗口(DecorView 自避让)系统根本不下发 ime insets(实测 API 35 连
+            // fitInsetsTypes 摘除 IME 都不行),必须 e2e + 自己避让系统栏:
+            // 窗口铺满屏幕,根布局补上状态栏/导航栏内边距,视觉与系统避让一致;
+            // 键盘 insets 随之正常下发,各行的浮沉交给 applyImeLayout 按行位与焦点决定。
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { _, insets ->
+                val bars = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+                )
+                val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+                rootLayout.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+                onImeInsets((ime.bottom - bars.bottom).coerceAtLeast(0))
+                insets
+            }
+        } else {
+            rootLayout.viewTreeObserver.addOnGlobalLayoutListener {
+                val frame = Rect()
+                window.decorView.getWindowVisibleDisplayFrame(frame)
+                val decorH = window.decorView.height.takeIf { it > 0 } ?: frame.bottom
+                val up = frame.bottom < decorH * 0.85
+                if (up != keyboardUp) {
+                    keyboardUp = up
+                    updatePasswordPickBar()
+                }
+            }
+        }
+        applyImeLayout()
 
         // 地址栏框内控件:左引擎选择,右动作按钮(图标随输入内容切换)
         addressBox = findViewById(R.id.address_bar_box)
@@ -481,7 +610,7 @@ class BrowserActivity : AppCompatActivity() {
             if (tabBarHidden) {
                 tabs.getOrNull(currentIndex)?.let { tab ->
                     if (hasFocus) {
-                        if (!isHistoryTab(tab) && !isBookmarksTab(tab) && !isDownloadsTab(tab)) {
+                        if (!isListPageUrl(tab.url)) {
                             addressBar.setText(tab.url)
                             addressBar.setSelection(0, addressBar.text?.length ?: 0)
                         }
@@ -692,10 +821,10 @@ class BrowserActivity : AppCompatActivity() {
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
                     val url = o.optString("url")
-                    // 历史记录页/收藏页/下载管理页是 about: 虚拟地址,也随会话保存
+                    // 历史/收藏/下载/密码管理页是 about: 虚拟地址,也随会话保存
                     if (
                         url != HISTORY_URL && url != BOOKMARKS_URL &&
-                        url != DOWNLOADS_URL && !isWebUrl(url)
+                        url != DOWNLOADS_URL && url != PASSWORDS_URL && !isWebUrl(url)
                     ) continue
                     val history = mutableListOf<String>()
                     o.optJSONArray("history")?.let { ha ->
@@ -924,7 +1053,7 @@ class BrowserActivity : AppCompatActivity() {
 
     /** 地址栏浏览态文本:隐藏标签栏时显示页面标题(编辑态才换回网址),虚拟页留空 */
     private fun addressBrowseText(tab: TabItem): String = when {
-        isHistoryTab(tab) || isBookmarksTab(tab) || isDownloadsTab(tab) -> ""
+        isListPageUrl(tab.url) -> ""
         tabBarHidden -> displayTitle(tab)
         else -> tab.url
     }
@@ -1870,12 +1999,20 @@ class BrowserActivity : AppCompatActivity() {
     }
 
     /**
-     * 设置弹窗:清除数据、标签页和网址栏设置、标签页宽度、快捷输入、下载设置。
-     * 点功能项不关弹窗;二级弹窗叠加在本弹窗上面;点空白处 AlertDialog
-     * 默认只关最上面一层,实现一层一层关闭。
+     * 设置弹窗:密码管理、清除数据、标签页和网址栏设置、标签页宽度、快捷输入、下载设置。
+     * 点功能项不关弹窗(密码管理除外:开列表页前先收起弹窗,让新标签页露出来);
+     * 二级弹窗叠加在本弹窗上面;点空白处 AlertDialog 默认只关最上面一层,一层一层关闭。
      */
     private fun showSettingsDialog() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        lateinit var dialog: AlertDialog
+        box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
+            findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_passwords)
+            setOnClickListener {
+                dialog.dismiss()
+                openPasswordsTab()
+            }
+        })
         box.addView(layoutInflater.inflate(R.layout.item_browser_menu, box, false).apply {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_clear_data)
             setOnClickListener { confirmClearBrowserData() }
@@ -1896,7 +2033,7 @@ class BrowserActivity : AppCompatActivity() {
             findViewById<TextView>(R.id.menu_item_text).setText(R.string.browser_dl_settings)
             setOnClickListener { showDownloadSettingsDialog() }
         })
-        AlertDialog.Builder(this)
+        dialog = AlertDialog.Builder(this)
             .setTitle(R.string.browser_settings)
             .setView(box)
             .show()
@@ -2290,6 +2427,62 @@ class BrowserActivity : AppCompatActivity() {
             root.addView(progressBar, 1)
             root.addView(tabBarWrap, 2)
         }
+        applyImeLayout()
+    }
+
+    /** API 30+:键盘高度(im insets,像素)变化时同步键盘开合状态并重排各行 */
+    private fun onImeInsets(bottom: Int) {
+        if (bottom == imeHeightPx) return
+        imeHeightPx = bottom
+        val up = bottom > 0
+        if (up != keyboardUp) {
+            keyboardUp = up
+            updatePasswordPickBar()
+        }
+        applyImeLayout()
+    }
+
+    /**
+     * API 30+ 键盘布局(adjustNothing,窗口不缩放,全部手动安排):
+     * - 网页内容底部垫高到键盘上沿,页面能把聚焦的输入框滚进可视区(顶部模式等价于原 adjustResize);
+     * - 上下分布且网址栏行贴底:仅地址栏自身编辑时整行浮到键盘上沿;输入网页表单时原地不动(被键盘盖住);
+     * - 标签栏无论贴顶贴底都不跟随键盘(贴底时被键盘盖住);
+     * - 快捷输入条/账号选择条照旧浮在键盘上沿。
+     * 旧版本(API 26-29)维持 adjustResize 原行为,这里直接返回。
+     */
+    private fun applyImeLayout() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val content = findViewById<View>(R.id.content_frame) ?: return
+        val toolbarRow = findViewById<View>(R.id.toolbar_row) ?: return
+        val k = imeHeightPx
+        content.setPadding(0, 0, 0, k)
+        val editing = k > 0 && addressBar.hasFocus()
+        if (urlBarBottom && tabsOnTop) {
+            // 网址栏行贴底:编辑态整行浮到键盘上沿(进度条跟着走);网页输入时整行留在
+            // 屏幕底被键盘盖住,槽位收起让网页内容顶到键盘沿,不露背景缝
+            toolbarRow.visibility = if (k > 0 && !editing) View.GONE else View.VISIBLE
+            toolbarRow.translationY = if (editing) -k.toFloat() else 0f
+            progressBar.translationY = toolbarRow.translationY
+        } else if (urlBarBottom) {
+            // 标签栏贴底:永不跟随键盘;键盘弹出时它反正被盖住,槽位一并收起
+            tabBarWrap.visibility =
+                if (k > 0 || tabBarHidden) View.GONE else View.VISIBLE
+            toolbarRow.visibility = View.VISIBLE
+            toolbarRow.translationY = 0f
+            progressBar.translationY = 0f
+        } else {
+            // 两行都在顶部:不涉键盘浮沉,保持原位
+            toolbarRow.visibility = View.VISIBLE
+            toolbarRow.translationY = 0f
+            progressBar.translationY = 0f
+            tabBarWrap.visibility = if (tabBarHidden) View.GONE else View.VISIBLE
+        }
+        if (::inputHelperBar.isInitialized) {
+            inputHelperBar.translationY = if (editing) -k.toFloat() else 0f
+        }
+        if (::pwdPickBar.isInitialized) {
+            pwdPickBar.translationY = if (k > 0) -k.toFloat() else 0f
+        }
     }
 
     /** 标签栏右缘箭头:下方弹出全部标签页列表(左缘三杠拖动排序,点行切换,右侧 × 关闭) */
@@ -2555,13 +2748,13 @@ class BrowserActivity : AppCompatActivity() {
             .show()
     }
 
-    /** 菜单宽度:按最长文字测量,并保证不至于太窄 */
+    /** 菜单宽度:按最长文字测量;40dp 为条目左右 padding,16dp 补弹窗背景自带的内边距(不补最长一行会被截) */
     private fun measureMenuWidth(actions: List<BrowserMenuAction>): Int {
         val density = resources.displayMetrics.density
         val paint = TextView(this).apply { textSize = 16f }.paint
         var max = 0f
         actions.forEach { max = maxOf(max, paint.measureText(it.label)) }
-        return (max + 40 * density).toInt().coerceAtLeast((180 * density).toInt())
+        return (max + 56 * density).toInt().coerceAtLeast((180 * density).toInt())
     }
 
     /** 在系统浏览器打开当前标签页地址(优先 WebView 实际地址,其次最近可导航地址) */
@@ -2768,6 +2961,16 @@ class BrowserActivity : AppCompatActivity() {
                 injectDesktopLayout(view)
                 // blob 下载文件名钩子:捕获 <a download href="blob:..."> 的文件名
                 injectBlobDownloadHook(view)
+                // 登录表单捕获钩子:document 级委托监听,页面后续动态渲染的表单也能抓到
+                injectPasswordFormHook(view)
+                // 新文档开始:上一页的登录框/输入焦点标记作废,等探测 JS 重新回报
+                val started = tabs.firstOrNull { it.webView == view }
+                started?.hasLoginFields = false
+                started?.inputFocused = false
+                injectPasswordProbe(view)
+                if (tabs.indexOfFirst { it.webView == view } == currentIndex) {
+                    updatePasswordPickBar()
+                }
                 updateToolbarState()
             }
 
@@ -2783,6 +2986,11 @@ class BrowserActivity : AppCompatActivity() {
                 rememberNavigableUrl(view, url)
                 injectDesktopLayout(view)
                 injectBlobDownloadHook(view)
+                injectPasswordFormHook(view)
+                // 登录框探测:回报有无可见密码框,多账号选择条据此显隐(已挂过则本次跳过)
+                injectPasswordProbe(view)
+                // 同站点存过密码:只有一条时自动填充(只填空字段);多条交给多账号选择条
+                injectPasswordAutofill(view, url)
                 val index = tabs.indexOfFirst { it.webView == view }
                 if (index == currentIndex && index >= 0) {
                     if (isInternalOrBlankUrl(url)) {
@@ -2918,11 +3126,13 @@ class BrowserActivity : AppCompatActivity() {
         }
         // 历史记录/收藏页等虚拟地址不在这里 load(由调用方 loadDataWithBaseURL 填充)
         // 历史记录页挂 JS 桥:长按菜单 / 多选删除;收藏页挂桥:长按菜单;
-        // 下载管理页挂桥:点条目打开 / 长按菜单;blob 桥挂所有页面(下载请求到达时钩子已就位)
+        // 下载管理页挂桥:点条目打开 / 长按菜单;blob 桥挂所有页面(下载请求到达时钩子已就位);
+        // 密码桥挂所有页面:登录表单捕获 + 密码管理页的导出/导入/开关/长按菜单
         if (url == HISTORY_URL) wv.addJavascriptInterface(HistoryBridge(), "LdmHistory")
         if (url == BOOKMARKS_URL) wv.addJavascriptInterface(BookmarksBridge(), "LdmBookmarks")
         if (url == DOWNLOADS_URL) wv.addJavascriptInterface(DownloadsBridge(), "LdmDownloads")
         wv.addJavascriptInterface(BlobBridge(), "LdmBlob")
+        wv.addJavascriptInterface(PasswordsBridge(wv), "LdmPasswords")
         if (isWebUrl(url)) wv.loadUrl(url)
         // 记录触摸时刻(不消费事件):外部 scheme 打不开时,只有手势触发的才提示
         wv.setOnTouchListener { _, _ ->
@@ -2964,6 +3174,10 @@ class BrowserActivity : AppCompatActivity() {
         val wv = tabs[index].webView
         (wv.parent as? ViewGroup)?.removeView(wv)
         webContainer.addView(wv)
+        // 标签切走又切回:输入焦点/登录框可能已变化,主动拉一次探测回报再刷新选择条
+        wv.evaluateJavascript(
+            "(function(){if(window.__ldmPwdProbe){window.__ldmPwdProbe();}})()", null
+        )
         applyDesktopMode(wv)
         injectDesktopLayout(wv)
         if (updateSelection && tabLayout.selectedTabPosition != index) {
@@ -2973,9 +3187,8 @@ class BrowserActivity : AppCompatActivity() {
         val live = wv.url
         addressBar.setText(
             when {
-                // 虚拟页(历史记录/收藏/下载管理)地址栏留空
-                isHistoryTab(tabs[index]) || isBookmarksTab(tabs[index]) ||
-                    isDownloadsTab(tabs[index]) -> ""
+                // 虚拟页(历史记录/收藏/下载管理/密码管理)地址栏留空
+                isListPageUrl(tabs[index].url) -> ""
                 // 隐藏标签栏:浏览态显示页面标题(该标签正在加载则显示网址),编辑态才换回网址
                 tabBarHidden -> if (tabs[index].isLoading) (live ?: tabs[index].url)
                 else displayTitle(tabs[index])
@@ -2990,6 +3203,7 @@ class BrowserActivity : AppCompatActivity() {
         // 切到下载管理页立即推送最新数据:引擎空闲时没有回调,
         // 不推的话页面停留在外面操作期间(下载完成/删除)的旧内容
         if (isDownloadsTab(tabs[index])) pushDownloadsData()
+        updatePasswordPickBar()
         if (reveal) revealCurrentTab()
     }
 
@@ -3010,6 +3224,7 @@ class BrowserActivity : AppCompatActivity() {
         errorOverlay.visibility = View.GONE
         addressBar.setText("")
         updateToolbarState()
+        updatePasswordPickBar()
     }
 
     /**
@@ -3069,6 +3284,10 @@ class BrowserActivity : AppCompatActivity() {
         btnAction.visibility = if (editing) View.VISIBLE else View.GONE
         btnBookmark.visibility = if (editing) View.GONE else View.VISIBLE
         inputHelperBar.visibility = if (editing) View.VISIBLE else View.GONE
+        // 焦点进出编辑态会改变键盘弹出时贴底网址栏行的浮沉(仅地址栏编辑才浮);
+        // 顺带刷新账号选择条——地址栏编辑时它不该挂着(文档约定)
+        updatePasswordPickBar()
+        applyImeLayout()
     }
 
     /** 按输入内容切换右侧按钮图标与描述(空输入默认显示搜索) */
@@ -3210,19 +3429,11 @@ class BrowserActivity : AppCompatActivity() {
         tab.errorDetail = ""
         if (tabs.getOrNull(currentIndex) === tab) {
             errorOverlay.visibility = View.GONE
-            addressBar.setText(
-                if (url == HISTORY_URL || url == BOOKMARKS_URL || url == DOWNLOADS_URL) "" else url
-            )
+            addressBar.setText(if (isListPageUrl(url)) "" else url)
         }
         tab.webView.stopLoading()
         markLoading(tab)
-        if (url == HISTORY_URL) {
-            loadHistoryPageInto(tab)
-        } else if (url == BOOKMARKS_URL) {
-            loadBookmarksPageInto(tab)
-        } else if (url == DOWNLOADS_URL) {
-            loadDownloadsPageInto(tab)
-        } else {
+        if (!loadListPageInto(tab, url)) {
             tab.webView.loadUrl(url)
         }
         updateToolbarState()
@@ -3299,19 +3510,9 @@ class BrowserActivity : AppCompatActivity() {
      */
     private fun forceRefreshCurrent() {
         val tab = tabs.getOrNull(currentIndex) ?: return
-        // 虚拟页(历史记录/收藏/下载管理):重新生成 HTML 即为刷新
-        if (isHistoryTab(tab)) {
-            loadHistoryPageInto(tab)
-            return
-        }
-        if (isBookmarksTab(tab)) {
-            loadBookmarksPageInto(tab)
-            return
-        }
-        if (isDownloadsTab(tab)) {
-            loadDownloadsPageInto(tab)
-            return
-        }
+        // 虚拟列表页(历史记录/收藏/下载管理/密码管理):重新生成 HTML 即为刷新,
+        // about: 地址没有可重放的内容,reload 只会白屏
+        if (loadListPageInto(tab, tab.url)) return
         if (tab.showingErrorPage) {
             retryCurrent(force = true)
             return
@@ -3340,18 +3541,8 @@ class BrowserActivity : AppCompatActivity() {
      */
     private fun normalRefreshCurrent() {
         val tab = tabs.getOrNull(currentIndex) ?: return
-        if (isHistoryTab(tab)) {
-            loadHistoryPageInto(tab)
-            return
-        }
-        if (isBookmarksTab(tab)) {
-            loadBookmarksPageInto(tab)
-            return
-        }
-        if (isDownloadsTab(tab)) {
-            loadDownloadsPageInto(tab)
-            return
-        }
+        // 虚拟列表页刷新 = 重新渲染(同 forceRefreshCurrent,reload about: 地址会白屏)
+        if (loadListPageInto(tab, tab.url)) return
         if (tab.showingErrorPage || isInternalOrBlankUrl(tab.webView.url)) {
             retryCurrent(force = false)
             return
@@ -3437,10 +3628,15 @@ class BrowserActivity : AppCompatActivity() {
             text = getString(R.string.browser_clear_scope_history)
             textSize = 13f
         }
+        val cbPasswords = CheckBox(this).apply {
+            text = getString(R.string.browser_clear_scope_passwords)
+            textSize = 13f
+        }
         box.addView(cbCache)
         box.addView(cbCookies)
         box.addView(cbStorage)
         box.addView(cbHistory)
+        box.addView(cbPasswords)
         // 作用域开关:勾上 =「继续」按上面的范围只清当前网站;不勾 = 清所有网站
         val cbSiteOnly = CheckBox(this).apply {
             text = getString(R.string.browser_clear_site_only)
@@ -3456,7 +3652,9 @@ class BrowserActivity : AppCompatActivity() {
             .show()
         // 清理完成才关弹窗,没有可清的网站时提示后留在弹窗
         dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
-            if (!cbCache.isChecked && !cbCookies.isChecked && !cbStorage.isChecked && !cbHistory.isChecked) {
+            if (!cbCache.isChecked && !cbCookies.isChecked && !cbStorage.isChecked &&
+                !cbHistory.isChecked && !cbPasswords.isChecked
+            ) {
                 android.widget.Toast.makeText(
                     this@BrowserActivity,
                     R.string.browser_clear_scope_none,
@@ -3469,14 +3667,16 @@ class BrowserActivity : AppCompatActivity() {
                     cache = cbCache.isChecked,
                     cookies = cbCookies.isChecked,
                     storage = cbStorage.isChecked,
-                    history = cbHistory.isChecked
+                    history = cbHistory.isChecked,
+                    passwords = cbPasswords.isChecked
                 )
             } else {
                 clearBrowserData(
                     cache = cbCache.isChecked,
                     cookies = cbCookies.isChecked,
                     storage = cbStorage.isChecked,
-                    history = cbHistory.isChecked
+                    history = cbHistory.isChecked,
+                    passwords = cbPasswords.isChecked
                 )
                 true
             }
@@ -3490,9 +3690,16 @@ class BrowserActivity : AppCompatActivity() {
      * - cookies:Cookie(含登录状态)+ HTTP 基本认证凭据
      * - storage:localStorage / IndexedDB / WebSQL
      * - history:浏览历史(前进/后退列表)+ 表单自动填充
+     * - passwords:保存的网站密码(全部)
      */
     @Suppress("DEPRECATION")
-    private fun clearBrowserData(cache: Boolean, cookies: Boolean, storage: Boolean, history: Boolean) {
+    private fun clearBrowserData(
+        cache: Boolean,
+        cookies: Boolean,
+        storage: Boolean,
+        history: Boolean,
+        passwords: Boolean
+    ) {
         if (cookies) {
             CookieManager.getInstance().removeAllCookies(null)
             CookieManager.getInstance().removeSessionCookies(null)
@@ -3514,6 +3721,11 @@ class BrowserActivity : AppCompatActivity() {
             clearHistoryRecords()
             reloadHistoryPage()
         }
+        // 保存的网站密码全清,开着的密码页同步重渲染
+        if (passwords) {
+            PasswordStore.clearAll(this)
+            reloadPasswordsPage()
+        }
         // 无缓存状态重新加载,清理立即可见
         forceRefreshCurrent()
         android.widget.Toast.makeText(
@@ -3529,6 +3741,7 @@ class BrowserActivity : AppCompatActivity() {
      *   带 Domain 的补 .host / .去www.host 两种域(删 Domain=.example.com 这类常用 Cookie)
      * - storage:WebStorage.deleteOrigin,带/不带默认端口两种 origin 都试(Chromium 匹配)
      * - history:自管前进后退历史按源过滤(表单记录是全局数据,只能随「继续」全清)
+     * - passwords:保存的密码按源删除
      * - cache:无按站点清除的 API,跳过并提示(清缓存走「继续」全局路径)
      * 返回是否实际清了东西;清了则重载当前页让效果立即可见(被清登录态的站会跳登录页)。
      */
@@ -3536,7 +3749,8 @@ class BrowserActivity : AppCompatActivity() {
         cache: Boolean,
         cookies: Boolean,
         storage: Boolean,
-        history: Boolean
+        history: Boolean,
+        passwords: Boolean
     ): Boolean {
         val tab = tabs.getOrNull(currentIndex)
         val live = tab?.webView?.url
@@ -3585,6 +3799,10 @@ class BrowserActivity : AppCompatActivity() {
             reloadHistoryPage()
             persistTabs()
             updateToolbarState()
+            cleared = true
+        }
+        if (passwords && origin != null && PasswordStore.deleteForOrigin(this, origin)) {
+            reloadPasswordsPage()
             cleared = true
         }
         if (cache) {
@@ -4223,6 +4441,635 @@ class BrowserActivity : AppCompatActivity() {
             if (anchor.isAttachedToWindow) {
                 showListPopup(anchor, actions) { root.removeView(anchor) }
             }
+        }
+    }
+
+    // ---------- 密码管理(登录捕获 + 自动填充 + 虚拟列表页) ----------
+
+    private fun isPasswordsTab(item: TabItem) = item.url == PASSWORDS_URL
+
+    /** 虚拟列表页地址(历史/收藏/下载/密码管理):地址栏留空、导航/刷新走重渲染 */
+    private fun isListPageUrl(url: String?): Boolean =
+        url == HISTORY_URL || url == BOOKMARKS_URL ||
+            url == DOWNLOADS_URL || url == PASSWORDS_URL
+
+    /**
+     * 按虚拟地址把对应列表页渲染进该标签(about: 地址没有可重放内容,
+     * reload/loadUrl 都会白屏);非虚拟地址返回 false,调用方继续走正常加载。
+     */
+    private fun loadListPageInto(tab: TabItem, url: String?): Boolean {
+        when (url) {
+            HISTORY_URL -> loadHistoryPageInto(tab)
+            BOOKMARKS_URL -> loadBookmarksPageInto(tab)
+            DOWNLOADS_URL -> loadDownloadsPageInto(tab)
+            PASSWORDS_URL -> loadPasswordsPageInto(tab)
+            else -> return false
+        }
+        return true
+    }
+
+    private fun loadPasswordsPageInto(tab: TabItem) {
+        tab.webView.loadDataWithBaseURL(null, buildPasswordsHtml(), "text/html", "utf-8", PASSWORDS_URL)
+    }
+
+    /** 菜单「密码管理」:打开密码列表页;已开着就聚焦并按最新数据重渲染 */
+    private fun openPasswordsTab() {
+        val existing = tabs.indexOfFirst { isPasswordsTab(it) }
+        if (existing >= 0) {
+            loadPasswordsPageInto(tabs[existing])
+            showTab(existing, reveal = true)
+            return
+        }
+        val tab = TabItem(getString(R.string.browser_passwords), PASSWORDS_URL, createWebView(PASSWORDS_URL))
+        loadPasswordsPageInto(tab)
+        addTab(getString(R.string.browser_passwords), PASSWORDS_URL, tab)
+        showTab(tabs.lastIndex, reveal = true)
+    }
+
+    /** 重新渲染开着的密码页(保存/删除/导入后调用);密码变了,多账号选择条一并刷新 */
+    private fun reloadPasswordsPage() {
+        tabs.firstOrNull { isPasswordsTab(it) }?.let { loadPasswordsPageInto(it) }
+        updatePasswordPickBar()
+    }
+
+    /**
+     * 密码列表页 HTML:按站点分组 —— 站点行 = 站点名 + 账号数(单账号直接显示账号名),
+     * 点击展开/收起;展开后每个账号一行(账号居左,密码默认打码 ••••••、点行显示,
+     * 保存时间居右)。账号行长按弹原生菜单(复制账号/复制密码/在新标签页打开/删除),
+     * 站点行长按:在新标签页打开网站 / 删除该站点全部密码。
+     * 顶部搜索框按站点/账号过滤,搜索时命中的站点自动展开。
+     * 搜索条下方一排工具:导出/导入 + 询问保存总开关;列表末尾是「一律不保存」的
+     * 站点名单,点站点移出名单恢复询问。
+     */
+    private fun buildPasswordsHtml(): String {
+        val records = PasswordStore.list(this)
+        // 按站点分组并保持顺序(记录最新在前 → 组按各站最新一条的先后排);
+        // 账号行的 data-id 沿用存储列表下标,长按菜单按它取回记录
+        val groups = LinkedHashMap<String, MutableList<Pair<Int, PasswordStore.Entry>>>()
+        records.forEachIndexed { i, e ->
+            groups.getOrPut(e.origin) { mutableListOf() }.add(i to e)
+        }
+        val rows = StringBuilder()
+        groups.entries.forEachIndexed { gi, (origin, items) ->
+            val site = siteLabel(origin)
+            val subtitle = if (items.size == 1) {
+                items[0].second.username.ifBlank {
+                    getString(R.string.browser_passwords_no_username)
+                }
+            } else {
+                getString(R.string.browser_passwords_account_count, items.size)
+            }
+            val itemsHtml = StringBuilder()
+            for ((id, e) in items) {
+                val noUser = e.username.isBlank()
+                // 无用户名的条目按「无用户名」参与搜索,和列表显示一致
+                val searchable = (
+                    "$site " + e.username.ifBlank {
+                        getString(R.string.browser_passwords_no_username)
+                    } + " ${e.origin}"
+                    ).lowercase(Locale.ROOT)
+                itemsHtml.append(
+                    "<a class='item' data-id=\"$id\" " +
+                        "data-search=\"${htmlEscape(searchable)}\" " +
+                        "onclick='togglePwd(this)' " +
+                        "ontouchstart=\"lpStart(event,'$id',this)\" ontouchmove=\"lpCancel()\" " +
+                        "ontouchend=\"lpEnd(event)\">" +
+                        "<span class='col'>" +
+                        "<span class='t${if (noUser) " none" else ""}'>" +
+                        htmlEscape(
+                            e.username.ifBlank { getString(R.string.browser_passwords_no_username) }
+                        ) + "</span>" +
+                        "<span class='u pwd' data-p=\"${htmlEscape(e.password)}\">••••••</span></span>" +
+                        "<span class='time'>${formatHistoryTime(e.time)}</span></a>"
+                )
+            }
+            rows.append(
+                "<div class='grp'>" +
+                    "<a class='site' href='javascript:void(0)' onclick='toggleGrp($gi)' " +
+                    "ontouchstart=\"lpSiteStart(event,'$origin',this)\" ontouchmove=\"lpCancel()\" " +
+                    "ontouchend=\"lpEnd(event)\">" +
+                    "<span class='col'>" +
+                    "<span class='t'>${htmlEscape(site)}</span>" +
+                    "<span class='u'>${htmlEscape(subtitle)}</span></span>" +
+                    "<span class='arr' id='arr$gi'>▸</span></a>" +
+                    "<div class='items' id='items$gi' style='display:none'>$itemsHtml</div>" +
+                    "</div>"
+            )
+        }
+        val rowsHtml = if (rows.isEmpty()) {
+            "<div class='empty'>${getString(R.string.browser_passwords_empty)}</div>"
+        } else {
+            rows.toString()
+        }
+        val noResultHtml = if (records.isNotEmpty()) {
+            "<div id='noresult' class='empty' style='display:none'>" +
+                getString(R.string.browser_history_search_empty) + "</div>"
+        } else {
+            ""
+        }
+        // 「一律不保存」站点名单:点条目本身不动,点右侧 ✕ 才移出名单恢复询问;
+        // 名单空就整段不渲染
+        val neverHtml = StringBuilder()
+        PasswordStore.neverSaveOrigins(this)
+            .sortedBy { siteLabel(it) }
+            .forEach { origin ->
+                neverHtml.append(
+                    "<a class='never' href='javascript:void(0)'>" +
+                        "<span class='t'>${htmlEscape(siteLabel(origin))}</span>" +
+                        "<span class='rm' " +
+                        "onclick=\"event.stopPropagation();" +
+                        "LdmPasswords.onNeverRemove('$origin')\">✕</span></a>"
+                )
+            }
+        val neverSection = if (neverHtml.isEmpty()) {
+            ""
+        } else {
+            "<div class='neverhead'>" +
+                getString(R.string.browser_passwords_never_list) + "</div>" + neverHtml
+        }
+        val bg = colorHex(R.color.bg)
+        val fg = colorHex(R.color.on_surface)
+        val hint = colorHex(R.color.hint)
+        val div = colorHex(R.color.divider)
+        val surface = colorHex(R.color.surface)
+        val askOn = PasswordStore.askSaveEnabled(this)
+        val script = """
+            var lpTimer=null, lpFired=false, lpEl=null;
+            function lpStart(ev, id, el){
+              lpFired=false; lpEl=el;
+              lpTimer=setTimeout(function(){
+                lpFired=true;
+                if(window.LdmPasswords && lpEl){
+                  var r=lpEl.getBoundingClientRect();
+                  LdmPasswords.onLongPress(parseInt(id,10), r.top, r.height);
+                }
+              }, 500);
+            }
+            function lpSiteStart(ev, origin, el){
+              lpFired=false; lpEl=el;
+              lpTimer=setTimeout(function(){
+                lpFired=true;
+                if(window.LdmPasswords && lpEl){
+                  var r=lpEl.getBoundingClientRect();
+                  LdmPasswords.onSiteLongPress(origin, r.top, r.height);
+                }
+              }, 500);
+            }
+            function lpCancel(){ if(lpTimer){ clearTimeout(lpTimer); lpTimer=null; } }
+            function lpEnd(ev){ lpCancel(); if(lpFired){ ev.preventDefault(); lpFired=false; } }
+            function toggleGrp(gi){
+              var box=document.getElementById('items'+gi);
+              var arr=document.getElementById('arr'+gi);
+              if(!box){ return; }
+              var open=(box.style.display!=='none');
+              box.style.display=open?'none':'block';
+              if(arr){ arr.innerHTML=open?'▸':'▾'; }
+            }
+            function togglePwd(row){
+              var el=row.querySelector('.pwd');
+              if(!el){ return; }
+              if(el.getAttribute('data-on')==='1'){
+                el.setAttribute('data-on','0');
+                el.textContent='••••••';
+              } else {
+                el.setAttribute('data-on','1');
+                el.textContent=el.getAttribute('data-p')||'';
+              }
+            }
+            function onSearch(v){
+              var q=(v||'').toLowerCase().trim();
+              var grps=document.querySelectorAll('div.grp');
+              var n=0;
+              for(var g=0;g<grps.length;g++){
+                var items=grps[g].querySelectorAll('a.item');
+                var hit=0;
+                for(var i=0;i<items.length;i++){
+                  var m=(q==='')||((items[i].getAttribute('data-search')||'').indexOf(q)>=0);
+                  items[i].style.display=m?'':'none';
+                  if(m){ hit++; }
+                }
+                grps[g].style.display=(hit>0)?'':'none';
+                var box=document.getElementById('items'+g);
+                var arr=document.getElementById('arr'+g);
+                if(q===''){
+                  if(box){ box.style.display='none'; }
+                  if(arr){ arr.innerHTML='▸'; }
+                } else if(hit>0){
+                  if(box){ box.style.display='block'; }
+                  if(arr){ arr.innerHTML='▾'; }
+                }
+                n+=hit;
+              }
+              var nr=document.getElementById('noresult');
+              if(nr){ nr.style.display=(n===0)?'':'none'; }
+            }
+        """.trimIndent()
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'>" +
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>" +
+            "<title>${getString(R.string.browser_passwords)}</title><style>" +
+            "body{margin:0;background:$bg;color:$fg;}" +
+            "a{display:flex;align-items:center;gap:10px;padding:10px 14px;" +
+            "text-decoration:none;color:$fg;border-bottom:1px solid $div;" +
+            "-webkit-user-select:none;user-select:none;}" +
+            "a:active{background:$div;}" +
+            ".item{padding-left:38px;}" +
+            ".arr{flex-shrink:0;font-size:14px;color:$hint;}" +
+            ".col{flex:1;min-width:0;display:flex;flex-direction:column;}" +
+            ".t{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}" +
+            ".none{color:$hint;}" +
+            ".u{font-size:12px;color:$hint;white-space:nowrap;overflow:hidden;" +
+            "text-overflow:ellipsis;margin-top:2px;}" +
+            ".time{flex-shrink:0;font-size:12px;color:$hint;}" +
+            ".empty{padding:48px 0;text-align:center;color:$hint;font-size:14px;}" +
+            "#tools{display:flex;align-items:center;flex-wrap:wrap;gap:8px;" +
+            "padding:8px 12px;border-bottom:1px solid $div;}" +
+            ".tool{padding:6px 14px;border:1px solid $div;border-radius:8px;color:$fg;" +
+            "text-decoration:none;font-size:13px;-webkit-user-select:none;user-select:none;}" +
+            ".tool:active{background:$div;}" +
+            ".ask{margin-left:auto;font-size:13px;color:$fg;display:flex;align-items:center;gap:4px;}" +
+            ".neverhead{padding:16px 14px 6px;font-size:12px;color:$hint;" +
+            "border-top:1px solid $div;}" +
+            "a.never{padding:10px 14px;}" +
+            "a.never .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;" +
+            "white-space:nowrap;}" +
+            "a.never .rm{color:$hint;padding:8px 2px 8px 16px;font-size:16px;line-height:1;}" +
+            listPageSearchCss(surface, bg, fg, hint, div) +
+            "</style><script>$script</script></head><body>" +
+            listPageSearchBar(R.string.browser_passwords_search_hint) +
+            "<div id='tools'>" +
+            "<a class='tool' href='javascript:void(0)' onclick='LdmPasswords.onExport()'>" +
+            getString(R.string.browser_passwords_export) + "</a>" +
+            "<a class='tool' href='javascript:void(0)' onclick='LdmPasswords.onImport()'>" +
+            getString(R.string.browser_passwords_import) + "</a>" +
+            "<label class='ask'><input type='checkbox' id='ask'" +
+            (if (askOn) " checked" else "") +
+            " onchange='LdmPasswords.onAskChange(this.checked?1:0)'>" +
+            getString(R.string.browser_passwords_ask_save) + "</label>" +
+            "</div>" +
+            "$rowsHtml$noResultHtml$neverSection</body></html>"
+    }
+
+    /**
+     * 密码页 JS 桥:长按菜单 / 导出 / 导入 / 询问保存总开关 / 「一律不保存」名单;
+     * 登录表单捕获与登录框探测挂在所有页面的 WebView 上,故构造时记住自己的
+     * WebView,探测回报按它找到所属标签。
+     */
+    private inner class PasswordsBridge(private val view: WebView) {
+        @JavascriptInterface
+        fun onFormSubmit(json: String?) {
+            val o = if (json != null) runCatching { JSONObject(json) }.getOrNull() else null
+            if (o == null) return
+            val username = o.optString("u")
+            val password = o.optString("p")
+            val href = o.optString("h")
+            runOnUiThread { handlePasswordSubmission(href, username, password) }
+        }
+
+        @JavascriptInterface
+        fun onLoginState(hasPwdFields: Int, fieldFocused: Int) {
+            runOnUiThread {
+                val tab = tabs.firstOrNull { it.webView == view } ?: return@runOnUiThread
+                tab.hasLoginFields = hasPwdFields == 1
+                tab.inputFocused = fieldFocused == 1
+                if (tabs.getOrNull(currentIndex) === tab) updatePasswordPickBar()
+            }
+        }
+
+        @JavascriptInterface
+        fun onLongPress(id: Int, cssTop: Double, cssHeight: Double) {
+            runOnUiThread { showPasswordItemMenu(id, cssTop.toFloat(), cssHeight.toFloat()) }
+        }
+
+        @JavascriptInterface
+        fun onSiteLongPress(origin: String?, cssTop: Double, cssHeight: Double) {
+            runOnUiThread {
+                if (!origin.isNullOrBlank()) {
+                    showPasswordSiteMenu(origin, cssTop.toFloat(), cssHeight.toFloat())
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onExport() {
+            runOnUiThread { confirmPasswordExport() }
+        }
+
+        @JavascriptInterface
+        fun onImport() {
+            runOnUiThread {
+                importPasswordsLauncher.launch(
+                    arrayOf("application/json", "text/plain", "application/octet-stream")
+                )
+            }
+        }
+
+        @JavascriptInterface
+        fun onAskChange(value: Int) {
+            runOnUiThread {
+                PasswordStore.setAskSaveEnabled(this@BrowserActivity, value == 1)
+            }
+        }
+
+        /** 点「一律不保存」名单里的站点:移出名单恢复询问 */
+        @JavascriptInterface
+        fun onNeverRemove(origin: String?) {
+            runOnUiThread {
+                if (origin != null && PasswordStore.removeNeverSave(this@BrowserActivity, origin)) {
+                    reloadPasswordsPage()
+                    toast(R.string.browser_passwords_never_removed)
+                }
+            }
+        }
+    }
+
+    /** 密码条目长按菜单:复制账号 / 复制密码 / 在新标签页打开网站 / 删除(需确认) */
+    private fun showPasswordItemMenu(id: Int, cssTop: Float, cssHeight: Float) {
+        val entry = PasswordStore.list(this).getOrNull(id) ?: return
+        val passwordsView = tabs.firstOrNull { isPasswordsTab(it) }?.webView ?: return
+        val actions = listOf(
+            BrowserMenuAction(getString(R.string.browser_passwords_copy_account), action = {
+                copyToClipboard(entry.username)
+                toast(R.string.browser_copied)
+            }),
+            BrowserMenuAction(getString(R.string.browser_passwords_copy_password), action = {
+                copyToClipboard(entry.password)
+                toast(R.string.browser_copied)
+            }),
+            BrowserMenuAction(getString(R.string.browser_history_open_new_tab), action = {
+                addTab(siteLabel(entry.origin), entry.origin)
+                showTab(tabs.lastIndex, reveal = true)
+            }),
+            BrowserMenuAction(getString(R.string.browser_history_delete), action = {
+                AlertDialog.Builder(this)
+                    .setMessage(R.string.browser_passwords_delete_confirm)
+                    .setPositiveButton(R.string.confirm) { _, _ ->
+                        PasswordStore.delete(this, entry.id)
+                        reloadPasswordsPage()
+                        toast(R.string.browser_passwords_deleted)
+                    }
+                    .setNegativeButton(R.string.cancel, null)
+                    .show()
+            })
+        )
+        showRowMenuInWebView(passwordsView, cssTop, cssHeight, actions)
+    }
+
+    /** 密码页站点行长按菜单:在新标签页打开网站 / 删除该站点全部密码(需确认) */
+    private fun showPasswordSiteMenu(origin: String, cssTop: Float, cssHeight: Float) {
+        val passwordsView = tabs.firstOrNull { isPasswordsTab(it) }?.webView ?: return
+        val actions = listOf(
+            BrowserMenuAction(getString(R.string.browser_history_open_new_tab), action = {
+                addTab(siteLabel(origin), origin)
+                showTab(tabs.lastIndex, reveal = true)
+            }),
+            BrowserMenuAction(getString(R.string.browser_passwords_delete_site), action = {
+                AlertDialog.Builder(this)
+                    .setMessage(
+                        getString(R.string.browser_passwords_delete_site_confirm, siteLabel(origin))
+                    )
+                    .setPositiveButton(R.string.confirm) { _, _ ->
+                        if (PasswordStore.deleteForOrigin(this, origin)) {
+                            reloadPasswordsPage()
+                            toast(R.string.browser_passwords_deleted)
+                        }
+                    }
+                    .setNegativeButton(R.string.cancel, null)
+                    .show()
+            })
+        )
+        showRowMenuInWebView(passwordsView, cssTop, cssHeight, actions)
+    }
+
+    /** 密码页「导出」:没有记录先提示;有则弹明文提醒,确认后走 SAF 选位置写 JSON */
+    private fun confirmPasswordExport() {
+        if (PasswordStore.list(this).isEmpty()) {
+            toast(R.string.browser_passwords_export_empty)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.browser_passwords_export)
+            .setMessage(R.string.browser_passwords_export_warn)
+            .setPositiveButton(R.string.confirm) { _, _ ->
+                val name = "browser_passwords_" +
+                    SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(Date()) +
+                    ".json"
+                exportPasswordsLauncher.launch(name)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * 登录表单提交(捕获钩子回传):「登录时询问保存密码」总开关关了、或该站点在
+     * 「一律不保存」名单里就不打扰;同站点同账号密码没变不打扰;弹过没保存的组合
+     * 本次会话不再问;有询问弹窗开着时忽略新提交。
+     * 弹窗内容:网站 / 账号(无用户名显示灰字)/ 密码默认打码、点行显示。
+     */
+    private fun handlePasswordSubmission(href: String, username: String, password: String) {
+        if (password.isEmpty() || pwdPromptShowing || isInternalOrBlankUrl(href)) return
+        if (!PasswordStore.askSaveEnabled(this)) return
+        val origin = PasswordStore.originOf(href) ?: return
+        if (origin in PasswordStore.neverSaveOrigins(this)) return
+        val existing = PasswordStore.list(this)
+            .firstOrNull { it.origin == origin && it.username == username }
+        if (existing != null && existing.password == password) return
+        val sig = "$origin\n$username\n$password"
+        if (sig in pwdDismissed) return
+        pwdPromptShowing = true
+        val site = siteLabel(origin)
+        val updating = existing != null
+        AlertDialog.Builder(this)
+            .setTitle(
+                if (updating) R.string.browser_passwords_update_title
+                else R.string.browser_passwords_save_title
+            )
+            // 更新场景的说明句放 message,网站/账号/密码在自定义视图里
+            .apply { if (updating) setMessage(R.string.browser_passwords_update_note) }
+            .setView(passwordPromptView(site, username, password))
+            .setPositiveButton(
+                if (updating) R.string.browser_passwords_update_btn
+                else R.string.browser_passwords_save_btn
+            ) { _, _ ->
+                val result = PasswordStore.addOrUpdate(this, origin, username, password)
+                toast(
+                    if (result == null || result.first) {
+                        R.string.browser_passwords_saved
+                    } else {
+                        R.string.browser_passwords_updated
+                    }
+                )
+                reloadPasswordsPage()
+            }
+            .setNeutralButton(R.string.browser_passwords_never_save) { _, _ ->
+                // 记进该站点的「一律不保存」名单,之后这个站不再询问(密码页可恢复)
+                PasswordStore.addNeverSave(this, origin)
+                pwdDismissed.add(sig)
+                reloadPasswordsPage()
+                toast(R.string.browser_passwords_never_site)
+            }
+            .setNegativeButton(R.string.browser_passwords_not_save) { _, _ ->
+                pwdDismissed.add(sig)
+            }
+            .setOnDismissListener { pwdPromptShowing = false }
+            .show()
+    }
+
+    /**
+     * 保存/更新密码弹窗的内容区:网站、账号(无用户名显示灰字)、密码三行;
+     * 密码默认 ••••••,整行可点,点一下显示明文、再点隐藏。
+     */
+    private fun passwordPromptView(site: String, username: String, password: String): View {
+        val density = resources.displayMetrics.density
+        fun tip(text: String) = TextView(this).apply {
+            this.text = text
+            textSize = 13f
+            setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.hint))
+        }
+        fun value(text: String, grey: Boolean = false) = TextView(this).apply {
+            this.text = text
+            textSize = 15f
+            setTextColor(
+                ContextCompat.getColor(
+                    this@BrowserActivity,
+                    if (grey) R.color.hint else R.color.on_surface
+                )
+            )
+        }
+        fun labelSpacing() = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = (12 * density).toInt() }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((20 * density).toInt(), (6 * density).toInt(), (20 * density).toInt(), 0)
+        }
+        box.addView(tip(getString(R.string.browser_passwords_field_site)))
+        box.addView(value(site))
+        box.addView(
+            tip(getString(R.string.browser_passwords_field_account)),
+            labelSpacing()
+        )
+        box.addView(
+            value(
+                username.ifBlank { getString(R.string.browser_passwords_no_username) },
+                username.isBlank()
+            )
+        )
+        // 密码行:不写文字提示,点整行在打码与明文之间切换
+        var shown = false
+        val pwdValue = value("••••••")
+        val pwdRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, (4 * density).toInt(), 0, (4 * density).toInt())
+            addView(pwdValue)
+            setOnClickListener {
+                shown = !shown
+                pwdValue.text = if (shown) password else "••••••"
+            }
+        }
+        box.addView(tip(getString(R.string.browser_passwords_field_password)), labelSpacing())
+        box.addView(pwdRow)
+        return box
+    }
+
+    /** 登录表单捕获钩子(document 级委托监听,动态渲染的表单同样生效;每文档只挂一次) */
+    private fun injectPasswordFormHook(view: WebView?) {
+        if (view == null) return
+        view.evaluateJavascript(
+            "(function(){if(window.__ldmPwdHook){return;}window.__ldmPwdHook=1;$PWD_HOOK_JS})()",
+            null
+        )
+    }
+
+    /** 登录框探测:回报有无可见密码框 + 是否聚焦输入框(账号选择条显隐用;每文档只挂一次) */
+    private fun injectPasswordProbe(view: WebView?) {
+        if (view == null) return
+        view.evaluateJavascript(
+            "(function(){if(window.__ldmPwdProbe){return;}window.__ldmPwdProbe=1;$PWD_PROBE_JS})()",
+            null
+        )
+    }
+
+    /**
+     * 同站点只存了一条密码:自动填充首个可见密码框及其账号框(只填空字段,不覆盖已输入);
+     * 存了多条不自动挑一条,交给快捷输入条上方的多账号选择条。
+     */
+    private fun injectPasswordAutofill(view: WebView?, url: String?) {
+        if (view == null || !isWebUrl(url)) return
+        val pageUrl = url ?: return
+        val origin = PasswordStore.originOf(pageUrl) ?: return
+        val entries = PasswordStore.forOrigin(this, origin)
+        if (entries.size != 1) return
+        val entry = entries[0]
+        view.evaluateJavascript(
+            "(function(){var U=" + JSONObject.quote(entry.username) +
+                ",P=" + JSONObject.quote(entry.password) + ",F=0;$AUTOFILL_JS})()",
+            null
+        )
+    }
+
+    /** 多账号选择条点选:把该账号密码填进当前页面(F=1 覆盖已有值,方便换账号) */
+    private fun fillPasswordInto(view: WebView?, entry: PasswordStore.Entry) {
+        if (view == null) return
+        view.evaluateJavascript(
+            "(function(){var U=" + JSONObject.quote(entry.username) +
+                ",P=" + JSONObject.quote(entry.password) + ",F=1;$AUTOFILL_JS})()",
+            null
+        )
+    }
+
+    /**
+     * 账号选择条:输入状态(键盘弹出 + 页面输入框聚焦 + 站点存过密码 + 页面有
+     * 可见密码框)时,在快捷输入条上方显示一排账号按钮(点选填入);其余情况整条隐藏。
+     * 地址栏编辑不算——那是快捷输入条的地盘。
+     */
+    private fun updatePasswordPickBar() {
+        if (!::pwdPickBar.isInitialized) return
+        val tab = tabs.getOrNull(currentIndex)
+        val origin = tab?.webView?.url
+            ?.takeIf { isWebUrl(it) }
+            ?.let { PasswordStore.originOf(it) }
+        val entries = origin?.let { PasswordStore.forOrigin(this, it) } ?: emptyList()
+        if (tab == null || !tab.hasLoginFields || !tab.inputFocused || entries.isEmpty() ||
+            !keyboardUp || addressBar.hasFocus()
+        ) {
+            pwdPickBar.visibility = View.GONE
+            return
+        }
+        fillPasswordPickBar(entries)
+        pwdPickBar.visibility = View.VISIBLE
+    }
+
+    /** 把各账号排成按钮(账号为空显示「账号 N」),样式与快捷输入条一致 */
+    private fun fillPasswordPickBar(entries: List<PasswordStore.Entry>) {
+        val row = pwdPickBar.getChildAt(0) as? LinearLayout ?: return
+        row.removeAllViews()
+        val density = resources.displayMetrics.density
+        entries.forEachIndexed { i, e ->
+            row.addView(TextView(this).apply {
+                text = e.username.ifBlank {
+                    getString(R.string.browser_passwords_account_fallback, i + 1)
+                }
+                textSize = 15f
+                maxWidth = (160 * density).toInt()
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                gravity = Gravity.CENTER
+                setPadding((10 * density).toInt(), 0, (10 * density).toInt(), 0)
+                setTextColor(ContextCompat.getColor(this@BrowserActivity, R.color.on_surface))
+                background = ContextCompat.getDrawable(this@BrowserActivity, R.drawable.bg_address_bar)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, (36 * density).toInt()
+                ).apply {
+                    marginStart = (3 * density).toInt()
+                    marginEnd = (3 * density).toInt()
+                    topMargin = (2 * density).toInt()
+                    bottomMargin = (2 * density).toInt()
+                }
+                setOnClickListener {
+                    tabs.getOrNull(currentIndex)?.let { fillPasswordInto(it.webView, e) }
+                }
+            })
         }
     }
 
@@ -5488,7 +6335,21 @@ class BrowserActivity : AppCompatActivity() {
 
     private fun shortHost(url: String): String = runCatching {
         Uri.parse(url).host ?: url
-    }.getOrDefault(url).take(MAX_TAB_TITLE_LENGTH)
+    }.getOrDefault(url)
+
+    /**
+     * 密码场景的站点显示名:host + 非默认端口。存储按 origin(http(s)://host:port)
+     * 区分站点,同主机不同端口的服务是不同站点,显示必须把端口带出来才能分清;
+     * 默认端口(http 80 / https 443)照惯例省略。不做长度截断——端口/长 IP 被
+     * 截掉就和别的站分不清了,超长交给显示层省略号。
+     */
+    private fun siteLabel(origin: String): String = runCatching {
+        val uri = Uri.parse(origin)
+        val host = uri.host ?: return@runCatching origin
+        val port = uri.port
+        val default = (uri.scheme == "https" && port == 443) || (uri.scheme == "http" && port == 80)
+        if (port == -1 || default) host else "$host:$port"
+    }.getOrDefault(origin)
 
     override fun onPause() {
         super.onPause()
@@ -5533,8 +6394,6 @@ class BrowserActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val MAX_TAB_TITLE_LENGTH = 12
-
         /** GitHub 仓库地址(关于弹窗里点击新开标签页跳转) */
         private const val GITHUB_URL = "https://github.com/landamao/browser"
 
@@ -5580,6 +6439,9 @@ class BrowserActivity : AppCompatActivity() {
 
         /** 下载管理页虚拟地址(about: 系,同历史记录页,不进网页历史、随会话保存) */
         private const val DOWNLOADS_URL = "about:downloads"
+
+        /** 密码管理页虚拟地址(about: 系,同历史记录页,不进网页历史、随会话保存) */
+        private const val PASSWORDS_URL = "about:passwords"
 
         /** blob/data 落盘记录存储 key(JSONArray:id/uri/path/n/m/s/ts,新的在后) */
         private const val PREF_DOWNLOADS = "browser_downloads"
@@ -5645,6 +6507,172 @@ class BrowserActivity : AppCompatActivity() {
 
         /** 手势触发外部 scheme 失败后提示「没有应用」的时间窗(ms),超过视为页面自动唤端 */
         private const val GESTURE_TOAST_WINDOW_MS = 1500L
+
+        /**
+         * 登录表单捕获 JS(injectPasswordFormHook 包 IIFE 注入,每文档只挂一次):
+         * document 级委托监听三类提交信号 —— 表单 submit 事件、点击提交类按钮、
+         * 输入框里按回车(账号框/密码框都算)。点按钮分两种情况:按钮在表单里
+         * 要求该表单含可见密码框;不在任何表单里(Vuetify/Element 等「button +
+         * onClick」式登录页,页面根本没有 form 元素)则页面上有可见密码框就捕获。
+         * 重复信号(真表单里密码框回车会同时触发 keydown 和 submit)由原生侧
+         * 弹窗去重兜住。命中后把「首个账号候选 + 密码」连同 location.href 过桥
+         * 回传。所有辅助函数收在 IIFE 闭包里,不污染页面全局。
+         * 只注入主 frame(跨域登录 iframe 抓不到,是已知边界)。
+         */
+        private val PWD_HOOK_JS = """
+            var _vis=function(el){
+              if(!el||el.disabled||el.readOnly){return false;}
+              var t=(el.getAttribute('type')||'').toLowerCase();
+              if(t==='hidden'){return false;}
+              var r=el.getBoundingClientRect();
+              return !!(r&&r.width>0&&r.height>0);
+            };
+            var _textLike=function(el){
+              var t=(el.getAttribute('type')||'text').toLowerCase();
+              return t===''||t==='text'||t==='email'||t==='tel'||t==='username'||t==='number';
+            };
+            var _pwds=function(){
+              var a=document.querySelectorAll('input[type=password]'),out=[],i;
+              for(i=0;i<a.length;i++){ if(_vis(a[i])){ out.push(a[i]); } }
+              return out;
+            };
+            var _userOf=function(pwd){
+              var scope=pwd.form||document;
+              var a=scope.querySelectorAll('input'),cand=null,i;
+              for(i=0;i<a.length;i++){
+                if(a[i]===pwd){ break; }
+                if(_textLike(a[i])&&_vis(a[i])){ cand=a[i]; }
+              }
+              return cand;
+            };
+            var _send=function(u,p){
+              if(!p){ return; }
+              try{
+                if(window.LdmPasswords){
+                  LdmPasswords.onFormSubmit(JSON.stringify({u:u||'',p:p,h:location.href}));
+                }
+              }catch(e){}
+            };
+            var _capture=function(){
+              var ps=_pwds(),i,u;
+              for(i=0;i<ps.length;i++){
+                u=_userOf(ps[i]);
+                _send(u?u.value:'',ps[i].value);
+              }
+            };
+            var _formHasPwd=function(f){
+              if(!f){ return false; }
+              var a=f.querySelectorAll('input[type=password]'),i;
+              for(i=0;i<a.length;i++){ if(_vis(a[i])){ return true; } }
+              return false;
+            };
+            document.addEventListener('submit',function(){ _capture(); },true);
+            document.addEventListener('click',function(e){
+              var t=e.target;
+              if(!t||!t.closest){ return; }
+              var b=t.closest('button,input[type=submit],input[type=button],[role=button]');
+              if(!b){ return; }
+              var f=b.closest('form');
+              if(f){ if(_formHasPwd(f)){ _capture(); } }
+              else if(_pwds().length){ _capture(); }
+            },true);
+            document.addEventListener('keydown',function(e){
+              if(e.key!=='Enter'&&e.keyCode!==13){ return; }
+              var ae=document.activeElement;
+              if(ae&&ae.tagName==='INPUT'){ _capture(); }
+            },true);
+        """.trimIndent()
+
+        /**
+         * 自动填充 JS(注入时拼上 U/P 及 F 字面量):找首个可见密码框与它前面的
+         * 账号框填入;F=0 只填空字段(进页面自动填),F=1 覆盖已有值(多账号点选,
+         * 方便换账号)。赋值走 HTMLInputElement 原生 value setter 并派发
+         * input/change 事件,React 等受控组件也能接住。
+         */
+        private val AUTOFILL_JS = """
+            var _vis=function(el){
+              if(!el||el.disabled||el.readOnly){return false;}
+              var t=(el.getAttribute('type')||'').toLowerCase();
+              if(t==='hidden'){return false;}
+              var r=el.getBoundingClientRect();
+              return !!(r&&r.width>0&&r.height>0);
+            };
+            var _textLike=function(el){
+              var t=(el.getAttribute('type')||'text').toLowerCase();
+              return t===''||t==='text'||t==='email'||t==='tel'||t==='username'||t==='number';
+            };
+            var _userOf=function(pwd){
+              var scope=pwd.form||document;
+              var a=scope.querySelectorAll('input'),cand=null,i;
+              for(i=0;i<a.length;i++){
+                if(a[i]===pwd){ break; }
+                if(_textLike(a[i])&&_vis(a[i])){ cand=a[i]; }
+              }
+              return cand;
+            };
+            var _setVal=function(el,v){
+              if(!el||!v){ return; }
+              if(!F&&el.value){ return; }
+              try{
+                var d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+                if(d&&d.set){ d.set.call(el,v); } else { el.value=v; }
+              }catch(e){ try{ el.value=v; }catch(e2){} }
+              try{
+                el.dispatchEvent(new Event('input',{bubbles:true}));
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+              }catch(e){}
+            };
+            var pwd=null,ps=document.querySelectorAll('input[type=password]'),i,u;
+            for(i=0;i<ps.length;i++){ if(_vis(ps[i])){ pwd=ps[i]; break; } }
+            if(pwd){
+              u=_userOf(pwd);
+              _setVal(u,U);
+              _setVal(pwd,P);
+            }
+        """.trimIndent()
+
+        /**
+         * 登录框探测 JS(injectPasswordProbe 包 IIFE 注入,每文档只挂一次):
+         * 回报两件事 —— 页面有无可见密码框、当前是否聚焦在文本类输入框上。
+         * 注入即报一次,焦点进出输入框(focusin/focusout)再报,SPA 动态渲染的
+         * 登录框也能等到;回报函数同时挂在 window.__ldmPwdProbe,标签切回时
+         * 原生主动调它拉最新状态。账号选择条只在「有密码框且正在输入」时显示。
+         */
+        private val PWD_PROBE_JS = """
+            var _pvis=function(el){
+              if(!el||el.disabled||el.readOnly){return false;}
+              var t=(el.getAttribute('type')||'').toLowerCase();
+              if(t==='hidden'){return false;}
+              var r=el.getBoundingClientRect();
+              return !!(r&&r.width>0&&r.height>0);
+            };
+            var _ptextLike=function(el){
+              var t=(el.getAttribute('type')||'text').toLowerCase();
+              return t===''||t==='text'||t==='email'||t==='tel'||t==='username'||
+                t==='number'||t==='search'||t==='password';
+            };
+            var _pfocus=function(){
+              var ae=document.activeElement;
+              return !!(ae&&_ptextLike(ae)&&_pvis(ae));
+            };
+            var _preport=function(){
+              var a=document.querySelectorAll('input[type=password]'),n=0,i;
+              for(i=0;i<a.length;i++){ if(_pvis(a[i])){ n++; } }
+              try{
+                if(window.LdmPasswords){
+                  LdmPasswords.onLoginState(n>0?1:0,_pfocus()?1:0);
+                }
+              }catch(e){}
+            };
+            window.__ldmPwdProbe=_preport;
+            _preport();
+            var _poninput=function(e){
+              var t=e.target;
+              if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA')){ _preport(); }
+            };
+            document.addEventListener('focusin',_poninput,true);
+            document.addEventListener('focusout',_poninput,true);
+        """.trimIndent()
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
