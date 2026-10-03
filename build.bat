@@ -30,5 +30,3 @@ if /i "%TYPE%"=="release" if exist keystore.properties (
 )
 
 pause
-
-pause
